@@ -28,6 +28,7 @@ $$;
 
 -- Node state
 CREATE TABLE nodestate {
+	node_name text NOT NULL,       -- this node's name 
 	current text NOT NULL,         -- local node state, either ACTIVE or INACTIVE
 	epoch integer NOT NULL         -- starting from 1, increased everytime a cluster configuration change occurs 
 };
@@ -56,14 +57,18 @@ CREATE TABLE partitions (
 );
 
 
--- Shardman interface functions
+-- Sharding interface functions
 
-CREATE FUNCTION add_node (name_ text, host_ text, port_ text) RETURN bool AS $$
+CREATE FUNCTION add_node (name_ text, host_ text, port_ text) RETURNS mypg.nodes AS $$
 DECLARE
 	sys_id bigint;
 	new_epoch int;
-	copy_msg text = '';
-	insert_msg text = '';
+	copy_nodes_msg text := '';
+	init_nodestate_msg text := '';
+	insert_node_msg text := '';
+	copy_tables_msg text := '';
+	update_epoch_msg text := '';
+	err_msg text;
 BEGIN
 	-- Fail if this command is not run at the master node.
 	IF NOT shardman.is_shardlord()
@@ -71,10 +76,10 @@ BEGIN
 		RAISE EXCEPTION 'Please run add_node on the master.';
 	END IF;
 
-	-- Do nothing if the node is already in the cluster.
-	IF EXISTS (SELECT 1 FROM mypg.nodes WHERE node_name = name_)
+	-- Nothing needs to do if the node is healthy and active in the cluster setting.
+	IF EXISTS (SELECT 1 FROM mypg.nodes WHERE node_name = name_ and node_state = 'ACTIVE')
 	THEN
-		RAISE EXCEPTION 'Node with name % already exists.', name_
+		RAISE EXCEPTION 'Node % already exists.', name_
 	END IF;
 	
 	IF EXISTS (SELECT 1 FROM mypg.nodes WHERE host_ = host and port_ = port)
@@ -85,25 +90,36 @@ BEGIN
 	-- Insert new node in the nodes table and update the master' own epoch.
 	INSERT INTO mypg.nodes (node_name, system_id, host, port)
 	VALUES (name_, 0, host_, port_) RETURNING system_id INTO sys_id;
+
+	-- Send the current cluster metadata to the new node.
 	UPDATE nodestate SET epoch = epoch + 1 RETURNING epoch INTO new_epoch;
-
-	-- Send the current cluster metadata to the new node. This also verifies the new node is reachable.
-	copy_msg := gen_copy_table_sql(mypg.nodes);
+	copy_nodes_msg := format('%s:{%s;', name_, gen_copy_table_sql(mypg.nodes));
+	init_nodestate_msg := format('INSERT INTO mypg.nodestate (node_name,current,epoc) VALUES (%s,%c,%d);', 
+	 							name_, 'ACTIVE', new_epoch);
+	copy_nodes_msg := format('%s%s}', copy_nodes_msg, init_nodestate_msg)
+	mypg.broadcast(copy_nodes_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
 	
+	-- Send the tables metadata to the new node.
+	IF EXISTS (SELECT 1 FROM mypg.tables LIMIT 1) 
+	THEN
+		copy_tables_msg := format('%s:%s', name_, gen_copy_table_sql(mypg.tables));
+		PERFORM mypg.broadcast(copy_tables_msg);
+	END IF;
 
-	-- Inform the current cluster members of the new node.
-	FOR node IN SELECT * FROM mypg.nodes WHERE node.id <> new_id
+	-- Update each of the existing cluster member's metadata to include the new node. 
+	FOR node IN SELECT * FROM mypg.nodes WHERE node.node_name <> name_
 	LOOP
-		insert_msg := format('%s%d:INSERT INTO shardman.nodes (id,system_id,host,port) VALUES (%d, %s, %s, %s);', 
-		               insert_msg, node.id, new_id, host_, port_, sys_id);
+		insert_node_msg := format('%s%s:INSERT INTO mypg.nodes (node_name,system_id,host,port) VALUES (%s, %s, %s, %s);', 
+		                insert_node_msg, node.node_name, name_, sys_id, host_, port_);
+		update_epoch_msg := format('%s%s:UPDATE mypg.nodestate SET epoch = epoch + 1 WHERE node_name = %s RETURNING epoch',
+		 				update_epoch_msg, node.node_name, node.node_name);
 	END LOOP;
+	PERFORM mypg.broadcast(insert_node_msg);
+	mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
 
-
-
-
-
-
-
+	RETURN SELECT * FROM mypg.nodes WHERE node_name = name_;
+END
+$$ LANGUAGE plpgsql;
 
 
 -- Add node by updating the cluster metadata on each member node
@@ -2116,9 +2132,7 @@ RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
 CREATE FUNCTION broadcast(cmds text,
 						  ignore_errors bool = false,
 						  two_phase bool = false,
-						  sync_commit_on bool = false,
 						  sequential bool = false,
-						  super_connstr bool = false,
 						  iso_level text = null)
 RETURNS text AS 'pg_shardman' LANGUAGE C;
 
