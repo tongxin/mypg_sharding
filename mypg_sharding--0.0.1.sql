@@ -1349,7 +1349,7 @@ $$ LANGUAGE plpgsql;
 -- Get self node identifier.
 CREATE FUNCTION get_my_id() RETURNS int AS $$
 BEGIN
-    RETURN shardman.get_node_by_sysid(shardman.get_system_identifier());
+    RETURN shardman.get_node_by_sysid(mypg.get_system_id());
 END
 $$ LANGUAGE plpgsql;
 

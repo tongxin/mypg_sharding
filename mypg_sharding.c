@@ -31,9 +31,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(is_master);
 PG_FUNCTION_INFO_V1(broadcast);
 PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
-PG_FUNCTION_INFO_V1(pq_conninfo_parse);
-PG_FUNCTION_INFO_V1(get_system_identifier);
-PG_FUNCTION_INFO_V1(reset_synchronous_standby_names_on_commit);
+PG_FUNCTION_INFO_V1(get_system_id);
 
 /* GUC variables */
 static bool _is_master;
@@ -41,11 +39,6 @@ static char *_node_name;
 static char *nodestate;
 
 extern void _PG_init(void);
-
-static bool reset_ssn_callback_set = false;
-static bool reset_ssn_requested = false;
-
-static void reset_ssn_xact_callback(XactEvent event, void *arg);
 
 /*
  * Entrypoint of the module. Define GUCs.
@@ -405,7 +398,7 @@ gen_copy_table_sql(PG_FUNCTION_ARGS)
 	// get pg_dump path
 	if (SPI_execute("select setting from pg_config where name = 'BINDIR';",
 					true, 0) < 0)
-		elog(FATAL, "SHARDING: Failed to query pg_config");
+		elog(FATAL, "mypg_sharding: Failed to query pg_config");
 	join_path_component(pg_dump_path, 
 						SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1),
 						"pg_dump");
@@ -446,6 +439,7 @@ gen_copy_table_sql(PG_FUNCTION_ARGS)
 			 text_to_cstring(sql), pg_dump_cmd);
 	}
 
+	pfree(pg_dump_cmd);
 	PG_RETURN_TEXT_P(sql);
 }
 /*
@@ -557,154 +551,9 @@ reconstruct_table_attrs(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(query.data));
 }
 
-/*
- * Basically, this is an sql wrapper around PQconninfoParse. Given libpq
- * connstring, it returns a pair of keywords and values arrays with valid
- * nonempty options.
- */
 Datum
-pq_conninfo_parse(PG_FUNCTION_ARGS)
-{
-	TupleDesc            tupdesc;
-	/* array of keywords and array of vals as in PQconninfoOption */
-	Datum		values[2];
-	bool		nulls[2] = { false, false };
-	ArrayType *keywords; /* array of keywords */
-	ArrayType *vals; /* array of vals */
-	text **keywords_txt; /* we construct array of keywords from it */
-	text **vals_txt; /* array of vals constructed from it */
-	Datum *elems; /* just to convert text * to it */
-	int32 text_size;
-	int numopts = 0;
-	int i;
-	size_t len;
-	int16 typlen;
-	bool typbyval;
-	char typalign;
-	char *pqerrmsg;
-	char *errmsg_palloc;
-	char *conninfo = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	PQconninfoOption *opts = PQconninfoParse(conninfo, &pqerrmsg);
-	PQconninfoOption *opt;
-	HeapTuple res_heap_tuple;
-
-	if (pqerrmsg != NULL)
-	{
-		/* free malloced memory to avoid leakage */
-		errmsg_palloc = pstrdup(pqerrmsg);
-		PQfreemem((void *) pqerrmsg);
-		elog(ERROR, "SHARDING: PQconninfoParse failed: %s", errmsg_palloc);
-	}
-
-	/* compute number of opts and allocate text ptrs */
-	for (opt = opts; opt->keyword != NULL; opt++)
-	{
-		/* We are interested only in filled values */
-		if (opt->val != NULL)
-			numopts++;
-	}
-	keywords_txt = palloc(numopts * sizeof(text*));
-	vals_txt = palloc(numopts * sizeof(text*));
-
-	/* Fill keywords and vals */
-	for (opt = opts, i = 0; opt->keyword != NULL; opt++)
-	{
-		if (opt->val != NULL)
-		{
-			len = strlen(opt->keyword);
-			text_size = VARHDRSZ + len;
-			keywords_txt[i] = (text *) palloc(text_size);
-			SET_VARSIZE(keywords_txt[i], text_size);
-			memcpy(VARDATA(keywords_txt[i]), opt->keyword, len);
-
-			len = strlen(opt->val);
-			text_size = VARHDRSZ + len;
-			vals_txt[i] = (text *) palloc(text_size);
-			SET_VARSIZE(vals_txt[i], text_size);
-			memcpy(VARDATA(vals_txt[i]), opt->val, len);
-			i++;
-		}
-	}
-
-	/* Now construct arrays */
-	elems = (Datum*) palloc(numopts * sizeof(Datum));
-	/* get info about text type, we will pass it to array constructor */
-	get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
-
-	/* cast text * to datums for purity and construct array */
-	for (i = 0; i < numopts; i++) {
-		elems[i] = PointerGetDatum(keywords_txt[i]);
-	}
-	keywords = construct_array(elems, numopts, TEXTOID, typlen, typbyval,
-							   typalign);
-	/* same for valus */
-	for (i = 0; i < numopts; i++) {
-		elems[i] = PointerGetDatum(vals_txt[i]);
-	}
-	vals = construct_array(elems, numopts, TEXTOID, typlen, typbyval,
-							   typalign);
-
-	/* prepare to form the tuple */
-	values[0] = PointerGetDatum(keywords);
-	values[1] = PointerGetDatum(vals);
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("function returning record called in context "
-						"that cannot accept type record")));
-	BlessTupleDesc(tupdesc); /* Inshallah */
-
-	PQconninfoFree(opts);
-	res_heap_tuple = heap_form_tuple(tupdesc, values, nulls);
-	PG_RETURN_DATUM(HeapTupleGetDatum(res_heap_tuple));
-}
-
-Datum
-get_system_identifier(PG_FUNCTION_ARGS)
+get_system_id(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(GetSystemIdentifier());
 }
 
-/*
- * Execute "ALTER SYSTEM SET synchronous_standby_names = '' on commit"
- */
-Datum
-reset_synchronous_standby_names_on_commit(PG_FUNCTION_ARGS)
-{
-	if (!reset_ssn_callback_set)
-		RegisterXactCallback(reset_ssn_xact_callback, NULL);
-	reset_ssn_requested = true;
-	PG_RETURN_VOID();
-}
-
-static void
-reset_ssn_xact_callback(XactEvent event, void *arg)
-{
-	if (reset_ssn_requested)
-	{
-		/* I just wanted to practice a bit with PG nodes and lists */
-		A_Const *aconst = makeNode(A_Const);
-		List *set_stmt_args = list_make1(aconst);
-		VariableSetStmt setstmt;
-		AlterSystemStmt altersysstmt;
-
-		aconst->val.type = T_String;
-		aconst->val.val.str = ""; /* set it to empty value */
-		aconst->location = -1;
-
-		setstmt.type = T_VariableSetStmt;
-		setstmt.kind = VAR_SET_VALUE;
-		setstmt.name = "synchronous_standby_names";
-		setstmt.args = set_stmt_args;
-
-		altersysstmt.type = T_AlterSystemStmt;
-		altersysstmt.setstmt = &setstmt;
-		AlterSystemSetConfigFile(&altersysstmt);
-		pg_reload_conf(NULL);
-
-		list_free_deep(setstmt.args);
-		reset_ssn_requested = false;
-	}
-}
