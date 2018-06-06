@@ -16,6 +16,7 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
+#include "libpq-int.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/latch.h"
@@ -27,9 +28,7 @@
 /* ensure that extension won't load against incompatible version of Postgres */
 PG_MODULE_MAGIC;
 
-PG_FUNCTION_INFO_V1(shardlord_connection_string);
-PG_FUNCTION_INFO_V1(synchronous_replication);
-PG_FUNCTION_INFO_V1(is_shardlord);
+PG_FUNCTION_INFO_V1(is_master);
 PG_FUNCTION_INFO_V1(broadcast);
 PG_FUNCTION_INFO_V1(reconstruct_table_attrs);
 PG_FUNCTION_INFO_V1(pq_conninfo_parse);
@@ -37,11 +36,8 @@ PG_FUNCTION_INFO_V1(get_system_identifier);
 PG_FUNCTION_INFO_V1(reset_synchronous_standby_names_on_commit);
 
 /* GUC variables */
-static bool is_lord;
-static bool sync_replication;
-static char *shardlord_connstring;
-static char *node_name;
-
+static bool _is_master;
+static char *_node_name;
 static char *nodestate;
 
 extern void _PG_init(void);
@@ -58,10 +54,10 @@ void
 _PG_init()
 {
 	DefineCustomBoolVariable(
-		"mypg.shardlord",
-		"This node is the shardlord?",
+		"mypg.is_master",
+		"This node is the master?",
 		NULL,
-		&is_lord,
+		&_is_master,
 		false,
 		PGC_SUSET,
 		0,
@@ -71,92 +67,120 @@ _PG_init()
 		"mypg.node_name",
 		"Node name",
 		"The node name used in the sharding cluster context",
-		&node_name,
+		&_node_name,
 		"",
 		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
-
-	// /*
-	//  * Tell pathman that we want it to do shardman-specific COPY FROM: that
-	//  * is, support copy to foreign partitions by copying to foreign parent.
-	//  * For now we just ask to do it always. Better to turn on this in copy
-	//  * hook turn off after, however for that we need metadata on all nodes.
-	//  */
-	// *find_rendezvous_variable(
-	// 	"shardman_pathman_copy_from_rendezvous") = DatumGetPointer(1);
 }
 
 Datum
-synchronous_replication(PG_FUNCTION_ARGS)
+is_master(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(sync_replication);
+	PG_RETURN_BOOL(_is_master);
 }
 
 Datum
-is_shardlord(PG_FUNCTION_ARGS)
+node_name(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(is_lord);
+	size_t sz = strlen(_node_name);
+	size_t varsz = sz + VARHDRSZ;
+	text *out = (text *) palloc(varsz);
+	SET_VARSIZE(out, varsz);
+	memcpy(VARDATA(out), _node_name, sz);
+	PG_RETURN_TEXT_P(out);
 }
 
-
-/*
- * Wait until PQgetResult would certainly be non-blocking. Returns true if
- * everything is ok, false on error.
- */
 static bool
-wait_command_completion(PGconn* conn)
+wait_for_response(PGconn *conn)
 {
-	while (PQisBusy(conn))
-	{
-		/* Sleep until there's something to do */
-		int wc = WaitLatchOrSocket(MyLatch,
-								   WL_LATCH_SET | WL_SOCKET_READABLE,
-								   PQsocket(conn),
-#if defined (PGPRO_EE)
-								   false,
-#endif
-								   -1L, PG_WAIT_EXTENSION);
-		ResetLatch(MyLatch);
+	if (!conn)
+		return false;
 
-		CHECK_FOR_INTERRUPTS();
-
-		/* Data available in socket? */
-		if (wc & WL_SOCKET_READABLE)
+	while (conn->asyncStatus == PGASYNC_BUSY) {
+		int res;
+		/* flush what's unsent in the buffer
+		 */
+		while ((res = pqFlush(conn)) > 0)
 		{
-			if (!PQconsumeInput(conn))
-				return false;
+			if (pqWait(false, true, conn))
+			{
+				res = -1;
+				break;
+			}
+		}
+		
+		if (res ||							// res < 0,  pgFlush failure  
+			pqWait(true, false, conn) ||    // failure in waiting for read
+			pqReadData(conn) < 0) 			// failure in reading data
+		{
+			/*
+			 * conn->errorMessage has been set by pqWait or pqReadData. We
+			 * want to append it to any already-received error message.
+			 */
+			pqSaveErrorResult(conn);
+			conn->asyncStatus = PGASYNC_IDLE;
+			return false;
 		}
 	}
+
 	return true;
 }
 
 typedef struct
 {
 	PGconn* con;
+	char*   node;
 	char*   sql;
-	int     node;
 } Channel;
+
+#define MAX_NODENAME_SZ 256
+
+/* 
+ * Returns connection string if the node name is matched in mypg.nodes
+ * otherwise returns NULL. 
+ * Make sure SPI_connect() is already called within the context.  
+ */
+static char*
+check_and_get_node_constr(const char *nodename)
+{
+	char *cmd;
+	char *host;
+	char *port;
+	char *db;
+
+	cmd = psprintf("select host, port, dbname from mypg.nodes where node_name = %s", nodename);
+	if (SPI_execute(cmd, true, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)         // the number of returned rows is not 1
+	{
+		elog(ERROR, "mypg_sharding: failed to retrieve connection info for node %d", nodename);
+	}
+	pfree(cmd);
+	host = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+	port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+	db   = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5);
+
+	/* turns host and port into a connection string. */
+	return psprintf("host=%s port=%s dbname=%s", host, port, db);
+}
 
 Datum
 broadcast(PG_FUNCTION_ARGS)
 {
 	char* sql_full = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char* cmd = pstrdup(sql_full);
-	bool  ignore_errors = PG_GETARG_BOOL(1);
-	bool  two_phase = PG_GETARG_BOOL(2);
-	bool  sequential = PG_GETARG_BOOL(3);
-	char* iso_level = (PG_GETARG_POINTER(4) != NULL) ?
-		text_to_cstring(PG_GETARG_TEXT_PP(4)) : NULL;
+	bool  two_phase = PG_GETARG_BOOL(1);
+	bool  sequential = PG_GETARG_BOOL(2);
+	char* iso_level = (PG_GETARG_POINTER(3) != NULL) ?
+		text_to_cstring(PG_GETARG_TEXT_PP(3)) : NULL;
 	char* sep;
 	char* sql;
+	char* colon;
 	PGresult *res;
-	char* fetch_node_connstr;
+	char *conninfo_cmd;
 	int   rc;
 	int	  n;
-	int   node_id;
-	char* host;
-	char* port;
+	char* node;
 	char* connstr;
 	int   n_cmds = 0;
 	int   i;
@@ -174,7 +198,6 @@ broadcast(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 	chan = (Channel*) palloc(sizeof(Channel) * n_cons);
-	connstr = (char *) palloc(256);
 
 	/* Open connections and send all queries */
 	while ((sep = strchr(cmd, *cmd == '{' ? '}' : ';')) != NULL)
@@ -182,51 +205,43 @@ broadcast(PG_FUNCTION_ARGS)
 		*sep = '\0';
 
 		if (*cmd == '{')
+		{
 			cmd += 1;
-		rc = sscanf(cmd, "%d:%n", &node_id, &n);
-		if (rc != 1) {
-			elog(ERROR, "SHARDING: Invalid command string: '%s' in '%s'",
+		}
+		
+		/* Extract node name from the next command then construct a connection string. */
+		if (colon = strchr(cmd, ':'))
+		{
+			*colon = '\0';
+			node = cmd;
+		}
+		if (colon == NULL ||
+			(connstr = check_and_get_node_constr(node)) == NULL)
+		{
+			elog(ERROR, "mypg_sharding: invalid broadcast command: '%s' in '%s'.",
 				 cmd, sql_full);
 		}
-		sql = cmd + n; /* eat node id and colon */
+
+		sql = colon + 1;  // starting 1-off the colon
 		cmd = sep + 1;
-		fetch_node_connstr = psprintf(
-			"select host, port from SHARDING.nodes where id=%d", node_id);
-		if (SPI_execute(fetch_node_connstr, true, 0) < 0 || SPI_processed != 1)
-		{
-			elog(ERROR, "SHARDING: Failed to fetch connection info for node %d",
-				 node_id);
-		}
-		pfree(fetch_node_connstr);
-
-		host = SPI_getvalue(SPI_tuptable->vals[0],
-							SPI_tuptable->tupdesc, 4);
-		port = SPI_getvalue(SPI_tuptable->vals[0],
-							SPI_tuptable->tupdesc, 5);
-
-		sprintf(connstr, "host=%s port=%s", host, port);
 
 		if (n_cmds >= n_cons)
 		{
 			chan = (Channel*) repalloc(chan, sizeof(Channel) * (n_cons *= 2));
 		}
 
+		/* Set up connection to the target node. */
 		con = PQconnectdb(connstr);
 		chan[n_cmds].con = con;
-		chan[n_cmds].node = node_id;
+		chan[n_cmds].node = node;
 		chan[n_cmds].sql = sql;
 		n_cmds += 1;
 
+		pfree(connstr);
+
 		if (PQstatus(con) != CONNECTION_OK)
 		{
-			if (ignore_errors)
-			{
-				errstr = psprintf("%s<error>%d:Connection failure: %s</error>",
-								  errstr, node_id, PQerrorMessage(con));
-				chan[n_cmds-1].sql = NULL;
-				continue;
-			}
-			errstr = psprintf("Failed to connect to node %d: %s", node_id,
+			errstr = psprintf("Failed to connect to node %s: %s", node,
 							  PQerrorMessage(con));
 			goto cleanup;
 		}
@@ -241,26 +256,19 @@ broadcast(PG_FUNCTION_ARGS)
 		else if (iso_level)
 			appendStringInfoString(&fin_sql, "END;");
 
-		elog(DEBUG1, "Sending command '%s' to node %d", fin_sql.data, node_id);
+		elog(DEBUG1, "Sending command '%s' to node %s", fin_sql.data, node);
 		if (!PQsendQuery(con, fin_sql.data)
-			|| (sequential && !wait_command_completion(con)))
+			|| (sequential && !wait_for_response(con)))
 		{
-			if (ignore_errors)
-			{
-				errstr = psprintf("%s<error>%d:Failed to send query '%s': %s</error>",
-								  errstr, node_id, fin_sql.data, PQerrorMessage(con));
-				chan[n_cmds-1].sql = NULL;
-				continue;
-			}
-			errstr = psprintf("Failed to send query '%s' to node %d: %s'", fin_sql.data,
-							  node_id, PQerrorMessage(con));
+			errstr = psprintf("Failed to send query '%s' to node %s: %s'", fin_sql.data,
+							  node, PQerrorMessage(con));
 			goto cleanup;
 		}
 	}
 
 	if (*cmd != '\0')
 	{
-		elog(ERROR, "SHARDING: Junk at end of command list: %s", cmd);
+		elog(ERROR, "mypg_sharding: Junk at end of command list: %s in %s", cmd, sql_full);
 	}
 
 	/*
@@ -274,12 +282,6 @@ broadcast(PG_FUNCTION_ARGS)
 
 		con = chan[i].con;
 
-		if (chan[i].sql == NULL)
-		{
-			/* Ignore commands which were not sent */
-			continue;
-		}
-
 		/* Skip all but the last result */
 		while ((next_res = PQgetResult(con)) != NULL)
 		{
@@ -292,29 +294,18 @@ broadcast(PG_FUNCTION_ARGS)
 
 		if (res == NULL)
 		{
-			if (ignore_errors)
-			{
-				errstr = psprintf("%s<error>%d:Failed to received response for '%s': %s</error>",
-								  errstr, chan[i].node, chan[i].sql, PQerrorMessage(con));
-				continue;
-			}
-			errstr = psprintf("Failed to receive response for query %s from node %d: %s",
+			errstr = psprintf("Failed to receive response for query %s from node %s: %s",
 							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			goto cleanup;
 		}
 
-		/* Ok, result was successfully fetched, add it to resp */
+		/* Result was successfully fetched, add it to resp */
 		status = PQresultStatus(res);
-		if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK)
+		if (status != PGRES_EMPTY_QUERY && 
+			status != PGRES_TUPLES_OK   &&
+			status != PGRES_COMMAND_OK)
 		{
-			if (ignore_errors)
-			{
-				errstr = psprintf("%s<error>%d:Command %s failed: %s</error>",
-								  errstr, chan[i].node, chan[i].sql, PQerrorMessage(con));
-				PQclear(res);
-				continue;
-			}
-			errstr = psprintf("Command %s failed at node %d: %s",
+			errstr = psprintf("Command %s failed at node %s: %s",
 							  chan[i].sql, chan[i].node, PQerrorMessage(con));
 			PQclear(res);
 			goto cleanup;
@@ -323,23 +314,15 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			appendStringInfoChar(&resp, ',');
 		}
+		/* When rows are actually returned */
 		if (status == PGRES_TUPLES_OK)
 		{
 			if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
 			{
-				if (ignore_errors)
-				{
-					appendStringInfoString(&resp, "?");
-					elog(WARNING, "SHARDING: Query '%s' doesn't return single tuple at node %d",
-						 chan[i].sql, chan[i].node);
-				}
-				else
-				{
-					errstr = psprintf("Query '%s' doesn't return single tuple at node %d",
-									  chan[i].sql, chan[i].node);
-					PQclear(res);
-					goto cleanup;
-				}
+				errstr = psprintf("Query '%s' doesn't return single tuple at node %s",
+								  chan[i].sql, chan[i].node);
+				PQclear(res);
+				goto cleanup;
 			}
 			else
 			{
@@ -361,20 +344,20 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			if (*errstr)
 			{
-				res = PQexec(con, "ROLLBACK PREPARED 'shardlord'");
+				res = PQexec(con, "ROLLBACK PREPARED 'mypg'");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
-					elog(WARNING, "SHARDING: Rollback of 2PC failed at node %d: %s",
+					elog(WARNING, "mypg_sharding: Rollback of 2PC failed at node %s: %s",
 						 chan[i].node, PQerrorMessage(con));
 				}
 				PQclear(res);
 			}
 			else
 			{
-				res = PQexec(con, "COMMIT PREPARED 'shardlord'");
+				res = PQexec(con, "COMMIT PREPARED 'mypg'");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
-					elog(WARNING, "SHARDING: Commit of 2PC failed at node %d: %s",
+					elog(WARNING, "mypg_sharding: 2PC failed at node %s: %s",
 						 chan[i].node, PQerrorMessage(con));
 				}
 				PQclear(res);
@@ -385,18 +368,9 @@ broadcast(PG_FUNCTION_ARGS)
 
 	if (*errstr)
 	{
-		if (ignore_errors)
-		{
-			resetStringInfo(&resp);
-			appendStringInfoString(&resp, errstr);
-			elog(WARNING, "SHARDING: %s", errstr);
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-					 errmsg("SHARDING: %s", errstr)));
-		}
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+				 errmsg("mypg_sharding: %s", errstr)));
 	}
 
 	pfree(chan);
@@ -405,12 +379,6 @@ broadcast(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(resp.data));
 }
 
-PG_FUNCTION_INFO_V1(gen_copy_schema_sql);
-Datum
-gen_copy_schema_sql(PG_FUNCTION_ARGS)
-{
-	
-}
 /*
  * Generate sql for copying table from one machine to another. 
  */

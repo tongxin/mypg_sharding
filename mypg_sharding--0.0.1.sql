@@ -28,7 +28,7 @@ $$;
 
 -- Node state
 CREATE TABLE nodestate {
-	node_name text NOT NULL,       -- this node's name 
+	node_name text NOT NULL,       -- the node name
 	current text NOT NULL,         -- local node state, either ACTIVE or INACTIVE
 	epoch integer NOT NULL         -- starting from 1, increased everytime a cluster configuration change occurs 
 };
@@ -39,15 +39,17 @@ CREATE TABLE nodes (
 	system_id bigint NOT NULL UNIQUE,
 	host text NOT NULL,
 	port text NOT NULL,
+	dbname text NOT NULL,
+	UNIQUE (host, port)
 );
 
 -- Distributed tables
 CREATE TABLE tables (
 	relation text PRIMARY KEY,     -- table name
-	key_col text,                  -- expression by which table is sharded
+	key_col text,                  -- sharding key column
 	modulo integer,                -- maximum number of distributed partitions
 	create_sql text NOT NULL,      -- sql to create the table
-	create_rules_sql text          -- sql to create rules for shared table
+--	create_rules_sql text          -- sql to create rules for shared table
 );
 
 CREATE TABLE partitions (
