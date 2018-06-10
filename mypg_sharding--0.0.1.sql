@@ -2095,11 +2095,11 @@ $$ LANGUAGE plpgsql;
 
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
-RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
+RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Reconstruct table attributes for foreign table
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
-RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
+RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Broadcast SQL commands to nodes and wait their completion.
 -- cmds is list of SQL commands terminated by semi-columns with node
@@ -2136,7 +2136,7 @@ CREATE FUNCTION broadcast(cmds text,
 						  two_phase bool = false,
 						  sequential bool = false,
 						  iso_level text = null)
-RETURNS text AS 'pg_shardman' LANGUAGE C;
+RETURNS TABLE (result text, error text) AS 'mypg_sharding' LANGUAGE C;
 
 -- Options to postgres_fdw are specified in two places: user & password in user
 -- mapping and everything else in create server. The problem is that we use
