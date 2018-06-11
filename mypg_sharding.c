@@ -128,7 +128,7 @@ typedef struct
 } Channel;
 
 static bool
-send_query(const PGconn *conn, Channel *chan, char *query)
+send_query(PGconn *conn, Channel *chan, char *query)
 {
 	if (!PQsendQuery(conn, query))
 	{
@@ -140,7 +140,7 @@ send_query(const PGconn *conn, Channel *chan, char *query)
 }
 
 static bool
-collect_result(const PGconn *conn, Channel *chan)
+collect_result(PGconn *conn, Channel *chan)
 {
 	PGresult *res = NULL;
 	PGresult *next_res;
@@ -194,6 +194,7 @@ collect_result(const PGconn *conn, Channel *chan)
 		chan->res = "";
 	}
 	PQclear(res);
+	return true;
 }
 
 #define MAX_NODENAME_SZ 256
@@ -247,7 +248,7 @@ broadcast(PG_FUNCTION_ARGS)
 	PGconn *con;
 	StringInfoData resp;
 	StringInfoData fin_sql;
-	StringInfoData errmsg;
+	StringInfoData errstr;
 	bool query_failed = false;
 
 	elog(DEBUG1, "Broadcast commmand '%s'", cmd);
@@ -339,7 +340,7 @@ broadcast(PG_FUNCTION_ARGS)
 
 cleanup:
 	initStringInfo(&resp);
-	initStringInfo(&errmsg);
+	initStringInfo(&errstr);
 
 	for (i = 0; i < n_cmds && !chan[i].err; i++);
 	if (i < n_cmds)
@@ -380,7 +381,7 @@ cleanup:
 		}
 		if (chan[i].err)
 		{
-			appendStringInfo(&errmsg, i == 0 ? "%s:%s" : ", %s:%s",
+			appendStringInfo(&errstr, i == 0 ? "%s:%s" : ", %s:%s",
 						 	chan[i].node, chan[i].err);
 		}
 		pfree(chan[i].res);
@@ -403,9 +404,9 @@ cleanup:
 	}
 	BlessTupleDesc(tupdesc);
 	datums[0] = CStringGetDatum(resp.data);
-	datums[1] = CStringGetDatum(errmsg.data);
+	datums[1] = CStringGetDatum(errstr.data);
 	isnull[0] = strlen(resp.data) ? false : true;
-	isnull[1] = strlen(errmsg.data) ? false : true;
+	isnull[1] = strlen(errstr.data) ? false : true;
 
 	return HeapTupleGetDatum(
 			heap_form_tuple(tupdesc, datums, isnull));
@@ -416,7 +417,7 @@ cleanup:
  */
 PG_FUNCTION_INFO_V1(gen_copy_table_sql);
 Datum
-	gen_copy_table_sql(PG_FUNCTION_ARGS)
+gen_copy_table_sql(PG_FUNCTION_ARGS)
 {
 	char *table_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char pg_dump_path[MAXPGPATH];
@@ -485,7 +486,7 @@ Datum
 
 PG_FUNCTION_INFO_V1(gen_create_table_sql);
 Datum
-	gen_create_table_sql(PG_FUNCTION_ARGS)
+gen_create_table_sql(PG_FUNCTION_ARGS)
 {
 	char pg_dump_path[MAXPGPATH];
 	/* let the mmgr free that */
@@ -562,7 +563,7 @@ Datum
  * The only constraint reconstructed is NOT NULL.
  */
 Datum
-	reconstruct_table_attrs(PG_FUNCTION_ARGS)
+reconstruct_table_attrs(PG_FUNCTION_ARGS)
 {
 	StringInfoData query;
 	Oid relid = PG_GETARG_OID(0);
@@ -599,7 +600,7 @@ Datum
 }
 
 Datum
-	get_system_id(PG_FUNCTION_ARGS)
+get_system_id(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(GetSystemIdentifier());
 }
