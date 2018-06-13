@@ -58,14 +58,19 @@ CREATE TABLE partitions (
 	r integer                      -- modulo index for the partition
 );
 
+-- Initialize nodestate for master
+INSERT INTO mypg.nodestate(node_name,current,epoch)
+VALUES ('lord', 'ACTIVE', 0);
+
 create type broadcast_result as (res_msg text, res_err text);
 
 -- Sharding interface functions
 
 CREATE FUNCTION add_node (name_ text, host_ text, port_ text) RETURNS mypg.cluster_nodes AS $$
 DECLARE
-	node cluster_nodes%ROWTYPE;
+	node mypg.cluster_nodes%ROWTYPE;
 	sys_id bigint;
+	currentdb text;
 	new_epoch int;
 	copy_nodes_msg text := '';
 	init_nodestate_msg text := '';
@@ -85,7 +90,7 @@ BEGIN
 	IF EXISTS (
 		SELECT 1 
 		FROM mypg.cluster_nodes
-		WHERE node_name = name_ and node_state = 'ACTIVE')
+		WHERE node_name = name_)
 	THEN
 		RAISE EXCEPTION 'Node % already exists.', name_;
 	END IF;
@@ -98,19 +103,21 @@ BEGIN
 		RAISE EXCEPTION 'Node exists with host=% and port=%', host_, port_;
 	END IF;
 
+	SELECT current_database() INTO currentdb;
+
 	-- Insert new node in the cluster_nodes table. Update master's epoch number.
-	INSERT INTO mypg.cluster_nodes (node_name, system_id, host, port)
-	VALUES (name_, 0, host_, port_) 
+	INSERT INTO mypg.cluster_nodes (node_name, system_id, host, port, dbname)
+	VALUES (name_, 0, host_, port_, currentdb) 
 		RETURNING system_id INTO sys_id;
 
 	-- Copy the updated cluster metadata off to the new node.
-	UPDATE nodestate
+	UPDATE mypg.nodestate
 	SET epoch = epoch + 1
 		RETURNING epoch INTO new_epoch;
 	copy_nodes_msg :=
-		format('%s', name_, gen_copy_table_sql(mypg.cluster_nodes));
+		format('%s', name_, mypg.gen_copy_table_sql('mypg.cluster_nodes'));
 	init_nodestate_msg :=
-		format('INSERT INTO mypg.nodestate (node_name,current,epoc) VALUES (%s, ''ACTIVE'' ,%d);', 
+		format('INSERT INTO mypg.nodestate (node_name,current,epoc) VALUES (%s, ''ACTIVE'' ,%s);', 
 				name_, new_epoch);
 	copy_nodes_msg :=
 		format('{%s:%s;%s}', name_, copy_nodes_msg, init_nodestate_msg);
@@ -127,7 +134,7 @@ BEGIN
 		SELECT 1 FROM mypg.tables) 
 	THEN
 		copy_tables_msg :=
-			format('%s:%s', name_, gen_copy_table_sql(mypg.tables));
+			format('%s:%s', name_, mypg.gen_copy_table_sql('mypg.tables'));
 		PERFORM mypg.broadcast(copy_tables_msg);
 	END IF;
 
@@ -158,6 +165,10 @@ $$ LANGUAGE plpgsql;
 
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
+RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
+
+-- Generate pg_dump'ed sql commands for table copying.
+CREATE FUNCTION gen_copy_table_sql(relation text)
 RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Reconstruct table attributes for foreign table

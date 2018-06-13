@@ -200,7 +200,7 @@ collect_result(PGconn *conn, Channel *chan)
 #define MAX_NODENAME_SZ 256
 
 /* 
- * Returns connection string if the node name is matched in mypg.nodes
+ * Returns connection string if the node name is matched in mypg.cluster_nodes
  * otherwise returns NULL. 
  * Make sure SPI_connect() is already called within the context.  
  */
@@ -212,7 +212,7 @@ query_node_constr(const char *nodename)
 	char *port;
 	char *db;
 
-	cmd = psprintf("select host, port, dbname from mypg.nodes where node_name = %s", nodename);
+	cmd = psprintf("select host, port, dbname from mypg.cluster_nodes where node_name = '%s'", nodename);
 	if (SPI_execute(cmd, true, 0) != SPI_OK_SELECT ||
 		SPI_processed != 1) // the number of returned rows is not 1
 	{
@@ -447,7 +447,7 @@ gen_copy_table_sql(PG_FUNCTION_ARGS)
 	SPI_execute("select current_database()", true, 0);
 	dbname = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 	// get port
-	SPI_execute("show port", true, 0);
+	SPI_execute("select setting from pg_settings where name = 'port'", true, 0);
 	port = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 	// get user
 	SPI_execute("select current_user", true, 0);
