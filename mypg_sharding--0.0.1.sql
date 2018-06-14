@@ -29,7 +29,7 @@ $$;
 -- Node state
 CREATE TABLE nodestate (
 	node_name text NOT NULL,       -- the node name
-	current text NOT NULL,         -- local node state, either ACTIVE or INACTIVE
+	current text NOT NULL,         -- local node state: INIT, ACTIVE, or INACTIVE
 	epoch integer NOT NULL         -- starting from 1, increased everytime a cluster configuration change occurs 
 );
 
@@ -58,17 +58,18 @@ CREATE TABLE partitions (
 	r integer                      -- modulo index for the partition
 );
 
--- Initialize nodestate for master
-INSERT INTO mypg.nodestate(node_name,current,epoch)
-VALUES ('lord', 'ACTIVE', 0);
+-- Make the above config tables dump-able
+SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
+SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
+SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
-create type broadcast_result as (res_msg text, res_err text);
+create type broadcast_result as (msg text, err text);
 
 -- Sharding interface functions
 
 CREATE FUNCTION add_node (name_ text, host_ text, port_ text) RETURNS mypg.cluster_nodes AS $$
 DECLARE
-	node mypg.cluster_nodes%ROWTYPE;
+	node mypg.cluster_nodes;
 	sys_id bigint;
 	currentdb text;
 	new_epoch int;
@@ -107,8 +108,28 @@ BEGIN
 
 	-- Insert new node in the cluster_nodes table. Update master's epoch number.
 	INSERT INTO mypg.cluster_nodes (node_name, system_id, host, port, dbname)
-	VALUES (name_, 0, host_, port_, currentdb) 
-		RETURNING system_id INTO sys_id;
+	VALUES (name_, 0, host_, port_, currentdb);
+
+	-- Check if the new node is in INIT state
+	SELECT * INTO res_msg, res_err
+	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
+								name_, name_));
+	RAISE NOTICE 'res_msg = % , res_err = %', res_msg, res_err;
+	IF res_msg IS NULL OR res_msg <> 'INIT'
+	THEN
+		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added.', name_;
+	END IF;
+
+	-- Retrieve the system id from the new node.
+	sys_id := mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
+	IF EXISTS (SELECT 1 FROM mypg.cluster_nodes WHERE system_id = sys_id)
+	THEN
+		RAISE EXCEPTION 'System id has been taken.';
+	END IF;
+	-- Update the node's system_id in the cluster_nodes table.
+	UPDATE mypg.cluster_nodes
+	SET system_id = sys_id
+	WHERE node_name = name_;
 
 	-- Copy the updated cluster metadata off to the new node.
 	UPDATE mypg.nodestate
@@ -117,8 +138,8 @@ BEGIN
 	copy_nodes_msg :=
 		format('%s', name_, mypg.gen_copy_table_sql('mypg.cluster_nodes'));
 	init_nodestate_msg :=
-		format('INSERT INTO mypg.nodestate (node_name,current,epoc) VALUES (%s, ''ACTIVE'' ,%s);', 
-				name_, new_epoch);
+		format('UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s',
+				epoch, name_);
 	copy_nodes_msg :=
 		format('{%s:%s;%s}', name_, copy_nodes_msg, init_nodestate_msg);
 	SELECT * INTO res_msg, res_err
@@ -126,7 +147,7 @@ BEGIN
 	
 	IF res_err IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to copy metadata to node %s', name_;
+		RAISE EXCEPTION 'Failed to copy metadata to node %', name_;
 	END IF;
 
 	-- Copy the tables metadata to the new node.
@@ -163,6 +184,7 @@ END
 $$ LANGUAGE plpgsql;
 
 
+
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
 RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
@@ -180,12 +202,15 @@ CREATE FUNCTION broadcast(cmds text,
 						  two_phase bool = false,
 						  sequential bool = false,
 						  iso_level text = null)
-RETURNS TABLE (result text, error text) AS 'mypg_sharding' LANGUAGE C;
-
+RETURNS broadcast_result AS 'mypg_sharding' LANGUAGE C;
 
 -- Check from configuration parameters if node plays role of shardlord
 CREATE FUNCTION is_master()
 	RETURNS bool AS 'mypg_sharding' LANGUAGE C STRICT;
+
+-- Returns this node's node name
+CREATE FUNCTION node_name() RETURNS text
+AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Disable writes to the partition, if we are not replica. This is handy because
 -- we use replication to copy table.
@@ -221,6 +246,22 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION get_system_id()
     RETURNS bigint AS 'mypg_sharding' LANGUAGE C STRICT;
 
------------------------------------------------------------------------
--- Some useful views.
------------------------------------------------------------------------
+-- Initialization 
+
+-- Initialize nodestate for master
+DO $$
+DECLARE
+is_master bool;
+init_state text;
+name_ text;
+BEGIN
+	is_master := mypg.is_master();
+	if is_master THEN
+		init_state := 'ACTIVE';
+	ELSE
+		init_state := 'INIT';
+	END IF;
+	name_ := mypg.node_name();
+	INSERT INTO mypg.nodestate(node_name,current,epoch)
+	VALUES (name_, init_state, 0);
+END$$;

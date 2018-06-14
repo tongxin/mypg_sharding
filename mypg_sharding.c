@@ -159,6 +159,7 @@ collect_result(PGconn *conn, Channel *chan)
 	{
 		chan->err = psprintf("Failed to receive response for query %s from node %s: %s",
 						 chan->sql, chan->node, PQerrorMessage(conn));
+
 		return false;
 	}
 
@@ -294,12 +295,12 @@ broadcast(PG_FUNCTION_ARGS)
 		chan[n_cmds].sql = sql;
 		chan[n_cmds].res = NULL;
 		chan[n_cmds].err = NULL;
-
+		n_cmds += 1;
 		pfree(connstr);
 
 		if (PQstatus(con) != CONNECTION_OK)
 		{
-			chan->err = psprintf("Failed to connect to node %s: %s", node,
+			chan[n_cmds-1].err = psprintf("Failed to connect to node %s: %s", node,
 							     PQerrorMessage(con));
 			goto cleanup;
 		}
@@ -320,8 +321,6 @@ broadcast(PG_FUNCTION_ARGS)
 		{
 			goto cleanup;
 		}
-
-		n_cmds += 1;
 	}
 
 	if (*cmd != '\0')
@@ -374,7 +373,7 @@ cleanup:
 				PQclear(res);
 			}
 		}
-		if (chan[i].err)
+		if (chan[i].res)
 		{
 			appendStringInfo(&resp, i == 0 ? "%s:%s" : ", %s:%s",
 						 	chan[i].node, chan[i].res);
@@ -403,6 +402,7 @@ cleanup:
                  errmsg("function returning record called in context that cannot accept type record")));
 	}
 	BlessTupleDesc(tupdesc);
+
 	datums[0] = CStringGetDatum(resp.data);
 	datums[1] = CStringGetDatum(errstr.data);
 	isnull[0] = strlen(resp.data) ? false : true;
