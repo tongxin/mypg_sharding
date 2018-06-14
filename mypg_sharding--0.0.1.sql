@@ -108,20 +108,26 @@ BEGIN
 
 	-- Insert new node in the cluster_nodes table. Update master's epoch number.
 	INSERT INTO mypg.cluster_nodes (node_name, system_id, host, port, dbname)
-	VALUES (name_, 0, host_, port_, currentdb);
+	VALUES (name_, 0, host_, port_, currentdb); 
 
 	-- Check if the new node is in INIT state
-	SELECT * INTO res_msg, res_err
+	SELECT msg INTO res_msg
 	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
 								name_, name_));
-	RAISE NOTICE 'res_msg = % , res_err = %', res_msg, res_err;
+	RAISE NOTICE 'res_msg = %', res_msg;
 	IF res_msg IS NULL OR res_msg <> 'INIT'
 	THEN
 		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added.', name_;
 	END IF;
 
 	-- Retrieve the system id from the new node.
-	sys_id := mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
+/* 	SELECT * INTO res_msg, res_err
+	FROM mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
+	IF res_err IS NOT NULL
+	THEN
+		RAISE EXCEPTION 'Remote error in mypg.get_system_id(): %', res_err;
+	END IF;
+	sys_id := res_msg;
 	IF EXISTS (SELECT 1 FROM mypg.cluster_nodes WHERE system_id = sys_id)
 	THEN
 		RAISE EXCEPTION 'System id has been taken.';
@@ -129,9 +135,9 @@ BEGIN
 	-- Update the node's system_id in the cluster_nodes table.
 	UPDATE mypg.cluster_nodes
 	SET system_id = sys_id
-	WHERE node_name = name_;
+	WHERE node_name = name_; */
 
-	-- Copy the updated cluster metadata off to the new node.
+/* 	-- Copy the updated cluster metadata off to the new node.
 	UPDATE mypg.nodestate
 	SET epoch = epoch + 1
 		RETURNING epoch INTO new_epoch;
@@ -177,7 +183,7 @@ BEGIN
 
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
-
+ */
 	SELECT * INTO node FROM mypg.cluster_nodes WHERE node_name = name_;
 	RETURN node;
 END

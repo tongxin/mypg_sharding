@@ -220,9 +220,9 @@ query_node_constr(const char *nodename)
 		elog(ERROR, "mypg_sharding: failed to retrieve connection info for node %s", nodename);
 	}
 	pfree(cmd);
-	host = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
-	port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
-	db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5);
+	host = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+	db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
 
 	/* turns host and port into a connection string. */
 	return psprintf("host=%s port=%s dbname=%s", host, port, db);
@@ -375,22 +375,26 @@ cleanup:
 		}
 		if (chan[i].res)
 		{
-			appendStringInfo(&resp, i == 0 ? "%s:%s" : ", %s:%s",
-						 	chan[i].node, chan[i].res);
+			appendStringInfo(&resp, i == 0 ? "%s" : ", %s",
+						 	/* chan[i].node, */ chan[i].res);
+			pfree(chan[i].res);
 		}
 		if (chan[i].err)
 		{
 			appendStringInfo(&errstr, i == 0 ? "%s:%s" : ", %s:%s",
 						 	chan[i].node, chan[i].err);
-		}
-		pfree(chan[i].res);
-		pfree(chan[i].err);
+			pfree(chan[i].err);
+		}		
 		PQfinish(con);
 	}
 
 	pfree(chan);
 	SPI_finish();
 
+	text *res_msg;
+	text *res_err;
+	int res_sz;
+	int err_sz;
 	TupleDesc tupdesc;
 	Datum datums[2];
 	bool isnull[2];
@@ -403,13 +407,21 @@ cleanup:
 	}
 	BlessTupleDesc(tupdesc);
 
-	datums[0] = CStringGetDatum(resp.data);
-	datums[1] = CStringGetDatum(errstr.data);
+	res_sz = VARHDRSZ+strlen(resp.data);
+	err_sz = VARHDRSZ+strlen(errstr.data);
+	res_msg = (text*)palloc(res_sz);
+	res_err = (text*)palloc(err_sz);
+	SET_VARSIZE(res_msg, res_sz);
+	SET_VARSIZE(res_err, err_sz);
+	strcpy(VARDATA(res_msg), resp.data);
+	strcpy(VARDATA(res_err), errstr.data);
+	datums[0] = PointerGetDatum(res_msg);
+	datums[1] = PointerGetDatum(res_err);
 	isnull[0] = strlen(resp.data) ? false : true;
 	isnull[1] = strlen(errstr.data) ? false : true;
 
-	return HeapTupleGetDatum(
-			heap_form_tuple(tupdesc, datums, isnull));
+	PG_RETURN_DATUM(HeapTupleGetDatum(
+				heap_form_tuple(tupdesc, datums, isnull)));
 }
 
 /*
