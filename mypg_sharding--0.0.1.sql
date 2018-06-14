@@ -114,14 +114,13 @@ BEGIN
 	SELECT msg INTO res_msg
 	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
 								name_, name_));
-	RAISE NOTICE 'res_msg = %', res_msg;
 	IF res_msg IS NULL OR res_msg <> 'INIT'
 	THEN
 		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added.', name_;
 	END IF;
 
 	-- Retrieve the system id from the new node.
-/* 	SELECT * INTO res_msg, res_err
+ 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
 	IF res_err IS NOT NULL
 	THEN
@@ -135,25 +134,25 @@ BEGIN
 	-- Update the node's system_id in the cluster_nodes table.
 	UPDATE mypg.cluster_nodes
 	SET system_id = sys_id
-	WHERE node_name = name_; */
+	WHERE node_name = name_;
 
-/* 	-- Copy the updated cluster metadata off to the new node.
+ 	-- Copy the updated cluster metadata off to the new node.
 	UPDATE mypg.nodestate
 	SET epoch = epoch + 1
 		RETURNING epoch INTO new_epoch;
 	copy_nodes_msg :=
-		format('%s', name_, mypg.gen_copy_table_sql('mypg.cluster_nodes'));
+		format('%s', mypg.gen_copy_table_sql('mypg.cluster_nodes'));
 	init_nodestate_msg :=
-		format('UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s',
-				epoch, name_);
+		format('UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s;',
+				new_epoch, name_);
 	copy_nodes_msg :=
-		format('{%s:%s;%s}', name_, copy_nodes_msg, init_nodestate_msg);
+		format('{%s:%s%s}', name_, copy_nodes_msg, init_nodestate_msg);
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(copy_nodes_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
 	
 	IF res_err IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to copy metadata to node %', name_;
+		RAISE EXCEPTION 'Failed to copy metadata to node %: %', name_, res_err;
 	END IF;
 
 	-- Copy the tables metadata to the new node.
@@ -183,7 +182,7 @@ BEGIN
 
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
- */
+ 
 	SELECT * INTO node FROM mypg.cluster_nodes WHERE node_name = name_;
 	RETURN node;
 END
