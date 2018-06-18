@@ -209,6 +209,9 @@ CREATE FUNCTION broadcast(cmds text,
 						  iso_level text = null)
 RETURNS broadcast_result AS 'mypg_sharding' LANGUAGE C;
 
+CREATE FUNCTION copy_table_data(rel text, node_name text)
+RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
+
 -- Check from configuration parameters if node plays role of shardlord
 CREATE FUNCTION is_master()
 	RETURNS bool AS 'mypg_sharding' LANGUAGE C STRICT;

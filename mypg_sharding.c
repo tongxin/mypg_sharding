@@ -40,6 +40,22 @@ static char *_node_name;
 
 extern void _PG_init(void);
 
+/* for internal use only. */
+static const char *pg_bin_path;
+
+static void
+init_pg_bin_path()
+{
+	SPI_connect();
+	// get pg_dump path
+	if (SPI_execute("select setting from pg_config where name = 'BINDIR';", true, 0) < 0)
+	{
+		elog(FATAL, "mypg_sharding: Failed to query pg_config");
+	}
+
+	pg_bin_path = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);	
+}
+
 /*
  * Entrypoint of the module. Define GUCs.
  */
@@ -64,6 +80,8 @@ void _PG_init()
 		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
+
+	init_pg_bin_path();
 }
 
 Datum
@@ -424,6 +442,212 @@ cleanup:
 				heap_form_tuple(tupdesc, datums, isnull)));
 }
 
+#define COPYBUFSIZ 8192
+
+PG_FUNCTION_INFO_V1(copy_table_data);
+Datum
+copy_table_data(PG_FUNCTION_ARGS)
+{
+	char *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *node = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	char pg_dump_path[MAXPGPATH];
+	char *pg_dump_cmd;
+	char *this_db;
+	char *this_port;
+	char *this_user;
+
+	SPI_connect();
+	// get pg_dump path
+	join_path_components(pg_dump_path, pg_bin_path, "pg_dump");
+	canonicalize_path(pg_dump_path);
+	// prepare the pg_dump command
+	SPI_execute("select current_database()", true, 0);
+	this_db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	SPI_execute("select setting from pg_settings where name = 'port'", true, 0);
+	this_port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	SPI_execute("select current_user", true, 0);
+	this_user = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	SPI_finish();
+	pg_dump_cmd = psprintf("%s -t %s -a -d %s -U %s -p %s",
+						   pg_dump_path, relname, this_db, this_user, this_port);
+	pfree(this_db);
+	pfree(this_port);
+	pfree(this_user);
+
+	/*
+	 * Wire the copy command and data outputted by pg_dump to the remote server
+	 */
+	FILE *s;
+	char buf[COPYBUFSIZ];
+	int nr;
+	bool done = false;
+	int lineno = 0;
+	volatile PQExpBuffer query_buf;
+	volatile PQExpBuffer linebuf;
+	int query_pos = 0;
+	bool success;
+
+	char *connstr;
+	PGconn *conn;
+	PGresult *res;
+	ExecStatusType status;
+
+	if ((s = popen(pg_dump_cmd, "r")) == NULL)
+	{
+		elog(ERROR, "mypg_sharding: pg_dump command failed -- %s", pg_dump_cmd);
+		return NULL;
+	}
+
+	if ((connstr = query_node_constr(node)) == NULL)
+	{
+		elog(ERROR, "mypg_sharding: Failed to find connection string for node %s", node);
+	}
+	conn = PQconnectdb(connstr);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		elog(ERROR, "mypg_sharding: Failed to connect to node %s: %s", node, PQerrorMessage(conn));
+	}
+	pfree(connstr);
+
+	query_buf = createPQExpBuffer();
+	linebuf = createPQExpBuffer();
+	
+	while (!done)
+	{	
+		int  linelen;
+		bool in_comment = false;
+		bool command_or_copy_done = false;
+		bool in_copy = false;
+
+		resetPQExpBuffer(query_buf);
+
+		while (!command_or_copy_done)
+		{
+			/*
+			 * Running within this loop if the current command or data copying is not completed yet.
+			 */
+			char *fgetres;
+			char *comment;
+			char *sep;
+			char *pos;
+
+			// Assuming copy end marker '\.' is followed by a newline
+			fgetres = fgets(buf, sizeof(buf), s);
+			
+			if (!fgetres) 
+			{
+				done = true;
+				break;
+			}
+		
+			appendPQExpBufferStr(linebuf, buf);
+			if (PQExpBufferBroken(linebuf))
+			{
+				elog(PANIC, "Out of memory.");
+				return NULL;
+			}
+			linelen = linebuf->len;
+			if (linebuf->data[linelen - 1] == '\n')
+			{
+				linebuf->data[linelen - 1] == '\0';
+			}
+			else 
+			{
+				/*
+				 * Current line is not complete, continue to read in.
+				 */
+				continue;
+			} 
+			if (++lineno == 1 && strncmp(buf, "PGDMP", 5) == 0)
+			{
+				elog(ERROR, "Copy dumped data: custom-format pg_dump is not supported.");
+			}
+				
+			/*
+			 * Read and process a line
+			 */
+
+			if (in_copy)
+			{
+				int copy_ret = 1;
+				
+				if (strcmp(linebuf->data, "\\.\n") == 0 ||
+					(copy_ret = PQputCopyData(conn, linebuf->data, linelen)) <= 0)
+				{
+					/*
+					 * End data copying due to either an encounter of EOF or some other error.
+					 */
+					while (PQresultStatus(res = PQgetResult(conn)) == PGRES_COPY_IN)
+					{
+						PQclear(res);
+						PQputCopyEnd(conn, copy_ret > 0 ? NULL : "aborted because of read failure");
+					}
+					if (PQresultStatus(res) != PGRES_COMMAND_OK)
+					{
+						elog(ERROR, "mypg_sharding: %s", PQerrorMessage(conn));
+					}
+					in_copy = false;
+					command_or_copy_done = true;
+				}
+
+				goto end_of_line;
+			}
+			
+			comment = strstr(linebuf->data, "--");
+			if (comment)
+			{
+				*comment = '\0';
+			}
+			
+			appendPQExpBufferStr(query_buf, linebuf->data);
+
+			if (!strchr(linebuf->data, ';'))
+			{
+				/*
+				 * The end of line has not concluded a command. Continue to read next line. 
+				 */
+				goto end_of_line;
+			}
+
+			/*
+			 * Now that an entire command has bean read we are read to send it.
+			 */
+			res = PQexec(conn, query_buf->data+query_pos);
+			switch (PQresultStatus(res))
+			{
+			case PGRES_COPY_IN:
+				in_copy = true;
+				break;
+			case PGRES_EMPTY_QUERY:
+			case PGRES_COMMAND_OK:
+			case PGRES_TUPLES_OK:
+			{
+				/*
+				 * Non-copy commands executed successfully. Next move forward. 
+				 */
+				break;
+			}
+			default:
+				elog("mypg_sharding: PQexec error: %s", PQerrorMessage(conn));
+			}
+			PQclear(res);
+			query_pos = query_buf->len;
+			command_or_copy_done = true;
+
+		end_of_line:
+			resetPQExpBuffer(linebuf);
+		}
+	}
+cleanup:
+	fclose(s);
+	PQfinish(conn);
+	destroyPQExpBuffer(query_buf);
+	destroyPQExpBuffer(linebuf);
+
+	PG_RETURN_TEXT_P(cstring_to_text("OK"));
+}
+
 /*
  * Generate sql for copying table from one machine to another. 
  */
@@ -448,26 +672,24 @@ gen_copy_table_sql(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 	// get pg_dump path
-	if (SPI_execute("select setting from pg_config where name = 'BINDIR';",
-					true, 0) < 0)
-		elog(FATAL, "mypg_sharding: Failed to query pg_config");
-	join_path_components(pg_dump_path,
-						 SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1),
-						 "pg_dump");
+	join_path_components(pg_dump_path, pg_bin_path, "pg_dump");
 	canonicalize_path(pg_dump_path);
 	// get dbname
 	SPI_execute("select current_database()", true, 0);
-	dbname = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	dbname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	// get port
 	SPI_execute("select setting from pg_settings where name = 'port'", true, 0);
-	port = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	// get user
 	SPI_execute("select current_user", true, 0);
-	user = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	user = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	SPI_finish();
 
 	pg_dump_cmd = psprintf("%s -t %s -a -d %s -U %s -p %s",
 						   pg_dump_path, table_name, dbname, user, port);
+	pfree(dbname);
+	pfree(port);
+	pfree(user);
 
 	if ((fd = popen(pg_dump_cmd, "r")) == NULL)
 	{
