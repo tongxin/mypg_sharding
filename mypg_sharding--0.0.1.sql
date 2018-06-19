@@ -63,7 +63,7 @@ SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
 SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
 SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
-create type broadcast_result as (msg text, err text);
+create type exec_result as (msg text, err text);
 
 -- Sharding interface functions
 
@@ -111,12 +111,13 @@ BEGIN
 	VALUES (name_, 0, host_, port_, currentdb); 
 
 	-- Check if the new node is in INIT state
-	SELECT msg INTO res_msg
+	SELECT msg, err INTO res_msg, res_err
 	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
 								name_, name_));
 	IF res_msg IS NULL OR res_msg <> 'INIT'
 	THEN
-		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added.', name_;
+		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added: %, %', 
+						name_, res_msg, res_err;
 	END IF;
 
 	-- Retrieve the system id from the new node.
@@ -140,19 +141,24 @@ BEGIN
 	UPDATE mypg.nodestate
 	SET epoch = epoch + 1
 		RETURNING epoch INTO new_epoch;
-	copy_nodes_msg :=
-		format('%s', mypg.gen_copy_table_sql('mypg.cluster_nodes'));
-	init_nodestate_msg :=
-		format('UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s;',
-				new_epoch, name_);
-	copy_nodes_msg :=
-		format('{%s:%s%s}', name_, copy_nodes_msg, init_nodestate_msg);
+
 	SELECT * INTO res_msg, res_err
-	FROM mypg.broadcast(copy_nodes_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
+	FROM mypg.copy_table_data('mypg.cluster_nodes', name_);
+	IF res_err IS NOT NULL
+	THEN
+		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to node %: %', name_, res_err;
+	END IF;
+
+	init_nodestate_msg :=
+		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s;',
+				name_, new_epoch, name_);
+
+	SELECT * INTO res_msg, res_err
+	FROM mypg.broadcast(init_nodestate_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
 	
 	IF res_err IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to copy metadata to node %: %', name_, res_err;
+		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_err;
 	END IF;
 
 	-- Copy the tables metadata to the new node.
@@ -207,10 +213,10 @@ CREATE FUNCTION broadcast(cmds text,
 						  two_phase bool = false,
 						  sequential bool = false,
 						  iso_level text = null)
-RETURNS broadcast_result AS 'mypg_sharding' LANGUAGE C;
+RETURNS exec_result AS 'mypg_sharding' LANGUAGE C;
 
 CREATE FUNCTION copy_table_data(rel text, node_name text)
-RETURNS text AS 'mypg_sharding' LANGUAGE C STRICT;
+RETURNS exec_result AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Check from configuration parameters if node plays role of shardlord
 CREATE FUNCTION is_master()

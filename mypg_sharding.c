@@ -41,7 +41,7 @@ static char *_node_name;
 extern void _PG_init(void);
 
 /* for internal use only. */
-static const char *pg_bin_path;
+static const char *pg_bin_path = NULL;
 
 static void
 init_pg_bin_path()
@@ -54,6 +54,14 @@ init_pg_bin_path()
 	}
 
 	pg_bin_path = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);	
+}
+
+static const char*
+get_pg_bin_path()
+{
+	if (pg_bin_path == NULL)
+		init_pg_bin_path();
+	return pg_bin_path;
 }
 
 /*
@@ -80,8 +88,6 @@ void _PG_init()
 		PGC_SUSET,
 		0,
 		NULL, NULL, NULL);
-
-	init_pg_bin_path();
 }
 
 Datum
@@ -148,6 +154,7 @@ typedef struct
 static bool
 send_query(PGconn *conn, Channel *chan, char *query)
 {
+	
 	if (!PQsendQuery(conn, query))
 	{
 		chan->err = psprintf("Failed to send query '%s' to node %s: %s'", query,
@@ -192,6 +199,7 @@ collect_result(PGconn *conn, Channel *chan)
 		PQclear(res);
 		return false;
 	}
+
 
 	/* When rows are actually returned */
 	if (status == PGRES_TUPLES_OK)
@@ -269,8 +277,6 @@ broadcast(PG_FUNCTION_ARGS)
 	StringInfoData fin_sql;
 	StringInfoData errstr;
 	bool query_failed = false;
-
-	elog(DEBUG1, "Broadcast commmand '%s'", cmd);
 
 	SPI_connect();
 	chan = (Channel *)palloc(sizeof(Channel) * n_cons);
@@ -450,6 +456,8 @@ copy_table_data(PG_FUNCTION_ARGS)
 {
 	char *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *node = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	
+	char *err_msg = NULL;
 
 	char pg_dump_path[MAXPGPATH];
 	char *pg_dump_cmd;
@@ -459,18 +467,22 @@ copy_table_data(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 	// get pg_dump path
-	join_path_components(pg_dump_path, pg_bin_path, "pg_dump");
+	join_path_components(pg_dump_path, get_pg_bin_path(), "pg_dump");
 	canonicalize_path(pg_dump_path);
 	// prepare the pg_dump command
 	SPI_execute("select current_database()", true, 0);
 	this_db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	
 	SPI_execute("select setting from pg_settings where name = 'port'", true, 0);
 	this_port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	
 	SPI_execute("select current_user", true, 0);
 	this_user = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	SPI_finish();
+
 	pg_dump_cmd = psprintf("%s -t %s -a -d %s -U %s -p %s",
 						   pg_dump_path, relname, this_db, this_user, this_port);
+	pfree(relname);
 	pfree(this_db);
 	pfree(this_port);
 	pfree(this_user);
@@ -480,35 +492,40 @@ copy_table_data(PG_FUNCTION_ARGS)
 	 */
 	FILE *s;
 	char buf[COPYBUFSIZ];
-	int nr;
 	bool done = false;
 	int lineno = 0;
 	volatile PQExpBuffer query_buf;
 	volatile PQExpBuffer linebuf;
 	int query_pos = 0;
-	bool success;
+	bool in_copy = false;
 
 	char *connstr;
 	PGconn *conn;
 	PGresult *res;
-	ExecStatusType status;
 
 	if ((s = popen(pg_dump_cmd, "r")) == NULL)
 	{
-		elog(ERROR, "mypg_sharding: pg_dump command failed -- %s", pg_dump_cmd);
-		return NULL;
+		err_msg = psprintf("mypg_sharding: pg_dump command failed -- %s", pg_dump_cmd);
+		goto return_result;
 	}
 
 	if ((connstr = query_node_constr(node)) == NULL)
 	{
-		elog(ERROR, "mypg_sharding: Failed to find connection string for node %s", node);
+		err_msg = psprintf("mypg_sharding: Failed to find connection string for node %s", node);
+		fclose(s);
+		goto return_result;
 	}
+
 	conn = PQconnectdb(connstr);
+	pfree(connstr);
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
-		elog(ERROR, "mypg_sharding: Failed to connect to node %s: %s", node, PQerrorMessage(conn));
+		err_msg = psprintf("mypg_sharding: Failed to connect to node %s: %s", node, PQerrorMessage(conn));
+		PQfinish(conn);
+		fclose(s);
+		goto return_result;
 	}
-	pfree(connstr);
+	pfree(node);
 
 	query_buf = createPQExpBuffer();
 	linebuf = createPQExpBuffer();
@@ -518,9 +535,9 @@ copy_table_data(PG_FUNCTION_ARGS)
 		int  linelen;
 		bool in_comment = false;
 		bool command_or_copy_done = false;
-		bool in_copy = false;
 
 		resetPQExpBuffer(query_buf);
+		query_pos = 0;
 
 		while (!command_or_copy_done)
 		{
@@ -529,8 +546,6 @@ copy_table_data(PG_FUNCTION_ARGS)
 			 */
 			char *fgetres;
 			char *comment;
-			char *sep;
-			char *pos;
 
 			// Assuming copy end marker '\.' is followed by a newline
 			fgetres = fgets(buf, sizeof(buf), s);
@@ -541,24 +556,33 @@ copy_table_data(PG_FUNCTION_ARGS)
 				break;
 			}
 		
+			if (in_comment)
+			{
+				if (buf[strlen(buf) - 1] == '\n')
+					in_comment = false;
+				goto end_of_line;
+			}
+
 			appendPQExpBufferStr(linebuf, buf);
 			if (PQExpBufferBroken(linebuf))
 			{
 				elog(PANIC, "Out of memory.");
-				return NULL;
 			}
 			linelen = linebuf->len;
-			if (linebuf->data[linelen - 1] == '\n')
-			{
-				linebuf->data[linelen - 1] == '\0';
-			}
-			else 
+
+			if (linebuf->data[linelen - 1] != '\n')
 			{
 				/*
-				 * Current line is not complete, continue to read in.
+				 * Current line is not finshed yet, continue to read.
 				 */
 				continue;
-			} 
+			}
+
+			if (!in_copy)
+			{
+				linebuf->data[linelen - 1] = '\0';
+			}
+
 			if (++lineno == 1 && strncmp(buf, "PGDMP", 5) == 0)
 			{
 				elog(ERROR, "Copy dumped data: custom-format pg_dump is not supported.");
@@ -597,6 +621,7 @@ copy_table_data(PG_FUNCTION_ARGS)
 			comment = strstr(linebuf->data, "--");
 			if (comment)
 			{
+				in_comment = true;
 				*comment = '\0';
 			}
 			
@@ -613,6 +638,7 @@ copy_table_data(PG_FUNCTION_ARGS)
 			/*
 			 * Now that an entire command has bean read we are read to send it.
 			 */
+			elog(INFO, "%s", query_buf->data+query_pos); 
 			res = PQexec(conn, query_buf->data+query_pos);
 			switch (PQresultStatus(res))
 			{
@@ -629,7 +655,7 @@ copy_table_data(PG_FUNCTION_ARGS)
 				break;
 			}
 			default:
-				elog("mypg_sharding: PQexec error: %s", PQerrorMessage(conn));
+				elog(ERROR, "mypg_sharding: PQexec error: %s", PQerrorMessage(conn));
 			}
 			PQclear(res);
 			query_pos = query_buf->len;
@@ -639,13 +665,36 @@ copy_table_data(PG_FUNCTION_ARGS)
 			resetPQExpBuffer(linebuf);
 		}
 	}
-cleanup:
-	fclose(s);
-	PQfinish(conn);
 	destroyPQExpBuffer(query_buf);
 	destroyPQExpBuffer(linebuf);
+	PQfinish(conn);
+	fclose(s);
 
-	PG_RETURN_TEXT_P(cstring_to_text("OK"));
+	text *res_msg;
+	text *res_err;
+	bool  isnull[2];
+	Datum datums[2];
+	TupleDesc tupdesc;
+
+return_result:
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+	{
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("function returning record called in context that cannot accept type record")));
+	}
+	BlessTupleDesc(tupdesc);
+
+	res_msg = err_msg ? cstring_to_text("FAIL") : cstring_to_text("SUCCESS");
+	res_err = err_msg ? cstring_to_text(err_msg) : cstring_to_text("");
+	datums[0] = PointerGetDatum(res_msg);
+	datums[1] = PointerGetDatum(res_err);
+	isnull[0] = false;
+	isnull[1] = err_msg ? false : true;
+
+	HeapTuple tuple = heap_form_tuple(tupdesc, datums, isnull);
+	Datum datum = HeapTupleGetDatum(tuple);
+	PG_RETURN_DATUM(datum);
 }
 
 /*
@@ -672,7 +721,7 @@ gen_copy_table_sql(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 	// get pg_dump path
-	join_path_components(pg_dump_path, pg_bin_path, "pg_dump");
+	join_path_components(pg_dump_path, get_pg_bin_path(), "pg_dump");
 	canonicalize_path(pg_dump_path);
 	// get dbname
 	SPI_execute("select current_database()", true, 0);
