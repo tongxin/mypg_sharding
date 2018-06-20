@@ -53,7 +53,8 @@ init_pg_bin_path()
 		elog(FATAL, "mypg_sharding: Failed to query pg_config");
 	}
 
-	pg_bin_path = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);	
+	pg_bin_path = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	SPI_finish();
 }
 
 static const char*
@@ -216,10 +217,7 @@ collect_result(PGconn *conn, Channel *chan)
 			chan->res = pstrdup(PQgetvalue(res, 0, 0));
 		}
 	}
-	else
-	{
-		chan->res = "";
-	}
+
 	PQclear(res);
 	return true;
 }
@@ -240,6 +238,7 @@ query_node_constr(const char *nodename)
 	char *db;
 
 	cmd = psprintf("select host, port, dbname from mypg.cluster_nodes where node_name = '%s'", nodename);
+	SPI_connect();
 	if (SPI_execute(cmd, true, 0) != SPI_OK_SELECT ||
 		SPI_processed != 1) // the number of returned rows is not 1
 	{
@@ -250,6 +249,7 @@ query_node_constr(const char *nodename)
 	port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
 	db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
 
+	SPI_finish();
 	/* turns host and port into a connection string. */
 	return psprintf("host=%s port=%s dbname=%s", host, port, db);
 }
@@ -278,7 +278,6 @@ broadcast(PG_FUNCTION_ARGS)
 	StringInfoData errstr;
 	bool query_failed = false;
 
-	SPI_connect();
 	chan = (Channel *)palloc(sizeof(Channel) * n_cons);
 
 	/* Open connections and send all queries */
@@ -339,7 +338,7 @@ broadcast(PG_FUNCTION_ARGS)
 		else if (iso_level)
 			appendStringInfoString(&fin_sql, "END;");
 
-		elog(DEBUG1, "Sending command '%s' to node %s", fin_sql.data, node);
+		elog(INFO, "Sending command '%s' to %s", fin_sql.data, node);
 		if (!send_query(con, &chan[n_cmds], fin_sql.data) ||
 			(sequential && !collect_result(con, &chan[n_cmds])))
 		{
@@ -408,12 +407,11 @@ cleanup:
 			appendStringInfo(&errstr, i == 0 ? "%s:%s" : ", %s:%s",
 						 	chan[i].node, chan[i].err);
 			pfree(chan[i].err);
-		}		
+		}
 		PQfinish(con);
 	}
 
 	pfree(chan);
-	SPI_finish();
 
 	text *res_msg;
 	text *res_err;
@@ -465,19 +463,20 @@ copy_table_data(PG_FUNCTION_ARGS)
 	char *this_port;
 	char *this_user;
 
-	SPI_connect();
 	// get pg_dump path
 	join_path_components(pg_dump_path, get_pg_bin_path(), "pg_dump");
 	canonicalize_path(pg_dump_path);
 	// prepare the pg_dump command
+	SPI_connect();
 	SPI_execute("select current_database()", true, 0);
 	this_db = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-	
+
 	SPI_execute("select setting from pg_settings where name = 'port'", true, 0);
 	this_port = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-	
+
 	SPI_execute("select current_user", true, 0);
 	this_user = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
 	SPI_finish();
 
 	pg_dump_cmd = psprintf("%s -t %s -a -d %s -U %s -p %s",
@@ -638,7 +637,7 @@ copy_table_data(PG_FUNCTION_ARGS)
 			/*
 			 * Now that an entire command has bean read we are read to send it.
 			 */
-			elog(INFO, "%s", query_buf->data+query_pos); 
+//			elog(INFO, "%s", query_buf->data+query_pos); 
 			res = PQexec(conn, query_buf->data+query_pos);
 			switch (PQresultStatus(res))
 			{

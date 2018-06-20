@@ -146,11 +146,13 @@ BEGIN
 	FROM mypg.copy_table_data('mypg.cluster_nodes', name_);
 	IF res_err IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to node %: %', name_, res_err;
+		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to %: %', name_, res_err;
+	ELSE
+		RAISE INFO 'Successful copy of mypg.cluster_nodes to %', name_;
 	END IF;
 
 	init_nodestate_msg :=
-		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = %s;',
+		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = ''%s'';',
 				name_, new_epoch, name_);
 
 	SELECT * INTO res_msg, res_err
@@ -159,6 +161,8 @@ BEGIN
 	IF res_err IS NOT NULL
 	THEN
 		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_err;
+	ELSE
+		RAISE INFO 'nodestate on % is updated; epoch = %', name_, new_epoch;
 	END IF;
 
 	-- Copy the tables metadata to the new node.
