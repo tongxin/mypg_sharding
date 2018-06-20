@@ -63,11 +63,12 @@ SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
 SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
 SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
-create type exec_result as (msg text, err text);
+create type exec_result as (res text, msg text);
 
 -- Sharding interface functions
 
-CREATE FUNCTION add_node (name_ text, host_ text, port_ text) RETURNS mypg.cluster_nodes AS $$
+CREATE FUNCTION add_node (name_ text, host_ text, port_ text) 
+RETURNS table(res text, msg text) AS $$
 DECLARE
 	node mypg.cluster_nodes;
 	sys_id bigint;
@@ -78,8 +79,8 @@ DECLARE
 	insert_node_msg text := '';
 	copy_tables_msg text := '';
 	update_epoch_msg text := '';
+	res_res text;
 	res_msg text;
-	res_err text;
 BEGIN
 	-- Fail if this command is not run at the master node.
 	IF NOT mypg.is_master()
@@ -111,23 +112,23 @@ BEGIN
 	VALUES (name_, 0, host_, port_, currentdb); 
 
 	-- Check if the new node is in INIT state
-	SELECT msg, err INTO res_msg, res_err
+	SELECT * INTO res_res, res_msg 
 	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
 								name_, name_));
-	IF res_msg IS NULL OR res_msg <> 'INIT'
+	IF res_res IS NULL OR res_res <> 'INIT'
 	THEN
-		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added: %, %', 
-						name_, res_msg, res_err;
+		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added: %',
+						name_, res_res;
 	END IF;
 
 	-- Retrieve the system id from the new node.
- 	SELECT * INTO res_msg, res_err
+ 	SELECT * INTO res_res, res_msg
 	FROM mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
-	IF res_err IS NOT NULL
+	IF res_msg IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Remote error in mypg.get_system_id(): %', res_err;
+		RAISE EXCEPTION 'Remote error in mypg.get_system_id(): %', res_msg;
 	END IF;
-	sys_id := res_msg;
+	sys_id := res_res;
 	IF EXISTS (SELECT 1 FROM mypg.cluster_nodes WHERE system_id = sys_id)
 	THEN
 		RAISE EXCEPTION 'System id has been taken.';
@@ -138,11 +139,11 @@ BEGIN
 	WHERE node_name = name_;
 
  	-- Copy the cluster metadata off to the new node.
-	SELECT * INTO res_msg, res_err
+	SELECT * INTO res_res, res_msg
 	FROM mypg.copy_table_data('mypg.cluster_nodes', name_);
-	IF res_err IS NOT NULL
+	IF res_msg IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to %: %', name_, res_err;
+		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to %: %', name_, res_msg;
 	ELSE
 		RAISE INFO 'Successful copy of mypg.cluster_nodes to %', name_;
 	END IF;
@@ -155,12 +156,12 @@ BEGIN
 		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = ''%s'';',
 				name_, current_epoch, name_);
 
-	SELECT * INTO res_msg, res_err
+	SELECT * INTO res_res, res_msg
 	FROM mypg.broadcast(init_nodestate_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
 	
-	IF res_err IS NOT NULL
+	IF res_msg IS NOT NULL
 	THEN
-		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_err;
+		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_msg;
 	ELSE
 		RAISE INFO 'nodestate on % is updated; epoch = %', name_, current_epoch;
 	END IF;
@@ -190,18 +191,16 @@ BEGIN
 		 			update_epoch_msg, node.node_name, node.node_name);
 	END LOOP;
 	
-	SELECT * INTO res_msg, res_err
+	SELECT * INTO res_res, res_msg
 	FROM mypg.broadcast(insert_node_msg);
 
-	RAISE INFO '% %', res_msg, res_err;
-
-	SELECT * INTO res_msg, res_err
+	SELECT * INTO res_res, res_msg
 	FROM mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
  
-	RAISE INFO '% %', res_msg, res_err;
- 
-	SELECT * INTO node FROM mypg.cluster_nodes WHERE node_name = name_;
-	RETURN node;
+	RETURN QUERY
+	SELECT 'SUCCESS', format('%I, %I, %I, %I, %I', node_name, system_id, host, port, dbname)
+	FROM mypg.cluster_nodes
+	WHERE node_name = name_;	
 END
 $$ LANGUAGE plpgsql;
 
