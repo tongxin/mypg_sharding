@@ -72,7 +72,7 @@ DECLARE
 	node mypg.cluster_nodes;
 	sys_id bigint;
 	currentdb text;
-	new_epoch int;
+	current_epoch int;
 	copy_nodes_msg text := '';
 	init_nodestate_msg text := '';
 	insert_node_msg text := '';
@@ -137,11 +137,7 @@ BEGIN
 	SET system_id = sys_id
 	WHERE node_name = name_;
 
- 	-- Copy the updated cluster metadata off to the new node.
-	UPDATE mypg.nodestate
-	SET epoch = epoch + 1
-		RETURNING epoch INTO new_epoch;
-
+ 	-- Copy the cluster metadata off to the new node.
 	SELECT * INTO res_msg, res_err
 	FROM mypg.copy_table_data('mypg.cluster_nodes', name_);
 	IF res_err IS NOT NULL
@@ -151,9 +147,13 @@ BEGIN
 		RAISE INFO 'Successful copy of mypg.cluster_nodes to %', name_;
 	END IF;
 
+	SELECT epoch INTO current_epoch
+	FROM mypg.nodestate
+	LIMIT 1;
+
 	init_nodestate_msg :=
 		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = ''%s'';',
-				name_, new_epoch, name_);
+				name_, current_epoch, name_);
 
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(init_nodestate_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
@@ -162,7 +162,7 @@ BEGIN
 	THEN
 		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_err;
 	ELSE
-		RAISE INFO 'nodestate on % is updated; epoch = %', name_, new_epoch;
+		RAISE INFO 'nodestate on % is updated; epoch = %', name_, current_epoch;
 	END IF;
 
 	-- Copy the tables metadata to the new node.
@@ -174,24 +174,31 @@ BEGIN
 		PERFORM mypg.broadcast(copy_tables_msg);
 	END IF;
 
-	-- Update current cluster nodes to include metadata of the new node. 
+	UPDATE mypg.nodestate
+	SET epoch = epoch + 1
+		RETURNING epoch INTO current_epoch;
+	
+	-- Update on all cluster nodes to include the new node. 
 	FOR node IN 
 	SELECT * FROM mypg.cluster_nodes
-	WHERE node.node_name <> name_
 	LOOP
 		insert_node_msg :=
-			format('%s%s:INSERT INTO mypg.cluster_nodes (node_name,system_id,host,port) VALUES (%s, %s, %s, %s);', 
-		            insert_node_msg, node.node_name, name_, sys_id, host_, port_);
+			format('%s%s:INSERT INTO mypg.cluster_nodes VALUES (''%s'', %s, ''%s'', ''%s'', ''%s'');', 
+		            insert_node_msg, node.node_name, name_, sys_id, host_, port_, currentdb);
 		update_epoch_msg :=
-			format('%s%s:UPDATE mypg.nodestate SET epoch = epoch + 1 WHERE node_name = %s RETURNING epoch',
+			format('%s%s:UPDATE mypg.nodestate SET epoch = epoch + 1 WHERE node_name = ''%s'' RETURNING epoch;',
 		 			update_epoch_msg, node.node_name, node.node_name);
 	END LOOP;
 	
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(insert_node_msg);
 
+	RAISE INFO '% %', res_msg, res_err;
+
 	SELECT * INTO res_msg, res_err
 	FROM mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
+ 
+	RAISE INFO '% %', res_msg, res_err;
  
 	SELECT * INTO node FROM mypg.cluster_nodes WHERE node_name = name_;
 	RETURN node;
