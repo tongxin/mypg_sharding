@@ -45,17 +45,21 @@ CREATE TABLE cluster_nodes (
 
 -- Distributed tables
 CREATE TABLE tables (
-	relation text PRIMARY KEY,     -- table name
-	key_col text,                  -- sharding key column
+	relname text PRIMARY KEY,      -- table name
+	partcol text,                  -- sharding key column
 	modulo integer,                -- maximum number of distributed partitions
-	create_sql text NOT NULL       -- sql to create the table
+	create_sql text NOT NULL,      -- sql to create the table
+	rows_est real,
+	width_est int,
+	tuples  real
 --	create_rules_sql text          -- sql to create rules for shared table
 );
 
 CREATE TABLE partitions (
-	relation text,                 -- table name
-	node_name text,                -- node id for the partition
-	r integer                      -- modulo index for the partition
+	localid Oid,                   -- Local oid of the partition table
+	relname text,                  -- table name
+	p int,                         -- partition index
+	node text                      -- the node at which the partition is allocated
 );
 
 -- Make the above config tables dump-able
@@ -204,7 +208,17 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-
+CREATE FUNCTION pick_localpart_relid(arg_relname text)
+RETURNS oid AS $$
+DECLARE
+BEGIN
+	RETURN QUERY
+	SELECT oid
+	FROM mypg.partitions
+	WHERE relanme = arg_relname
+	LIMIT 1
+END
+$$ LANGUAGE plpgsql;
 
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
