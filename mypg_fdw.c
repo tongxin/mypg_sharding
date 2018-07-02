@@ -434,7 +434,7 @@ extern bool is_foreign_expr(PlannerInfo *root,
 				Expr *expr);
 
 static RelOptInfo *
-build_localpart_rel(const char *relname)
+build_localpart_rel(PlannerInfo *root, const char *relname)
 {
     /* Related to mypg.partitions */
     Relation    parts;
@@ -466,7 +466,61 @@ build_localpart_rel(const char *relname)
 		partid = InvalidOid;
 
     partrel = makeNode(RelOptInfo);
-    
+    partrel->reloptkind = RELOPT_OTHER_MEMBER_REL;
+	partrel->relids = bms_make_singleton(partid);
+	partrel->rows = 0;
+	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+	partrel->consider_startup = true;
+	partrel->consider_param_startup = false;	/* might get changed later */
+	partrel->consider_parallel = false; /* might get changed later */
+	partrel->reltarget = create_empty_pathtarget();
+	partrel->pathlist = NIL;
+	partrel->ppilist = NIL;
+	partrel->partial_pathlist = NIL;
+	partrel->cheapest_startup_path = NULL;
+	partrel->cheapest_total_path = NULL;
+	partrel->cheapest_unique_path = NULL;
+	partrel->cheapest_parameterized_paths = NIL;
+	partrel->direct_lateral_relids = NULL;
+	partrel->lateral_relids = NULL;
+	partrel->relid = partid;
+	partrel->rtekind = RTE_RELATION;
+	/* min_attr, max_attr, attr_needed, attr_widths are set below */
+	partrel->lateral_vars = NIL;
+	partrel->lateral_referencers = NULL;
+	partrel->indexlist = NIL;
+	partrel->statlist = NIL;
+	partrel->pages = 0;
+	partrel->tuples = 0;
+	partrel->allvisfrac = 0;
+	partrel->subroot = NULL;
+	partrel->subplan_params = NIL;
+	partrel->rel_parallel_workers = -1; /* set up in get_relation_info */
+	partrel->serverid = InvalidOid;
+	partrel->userid = InvalidOid;
+	partrel->useridiscurrent = false;
+	partrel->fdwroutine = NULL;
+	partrel->fdw_private = NULL;
+	partrel->unique_for_rels = NIL;
+	partrel->non_unique_for_rels = NIL;
+	partrel->baserestrictinfo = NIL;
+	partrel->baserestrictcost.startup = 0;
+	partrel->baserestrictcost.per_tuple = 0;
+	partrel->baserestrict_min_security = UINT_MAX;
+	partrel->joininfo = NIL;
+	partrel->has_eclass_joins = false;
+	partrel->part_scheme = NULL;
+	partrel->nparts = 0;
+	partrel->boundinfo = NULL;
+	partrel->partition_qual = NIL;
+	partrel->part_rels = NULL;
+	partrel->partexprs = NULL;
+	partrel->nullable_partexprs = NULL;
+	partrel->partitioned_child_rels = NIL;
+    partrel->top_parent_relids = NULL;
+    get_relation_info(root, partid, false, partrel);
+
+    return partrel;
 }
 
 /*
@@ -514,8 +568,12 @@ GetForeignRelSize(PlannerInfo *root,
 		appendStringInfo(fpinfo->relation_name, " %s",
 						 quote_identifier(rte->eref->aliasname));
 
-    /* build local partition table info. */
-    fpinfo->localpartrel = build_localpart_rel(relname);
+    /* We don't consider data skew across table shards in query planning.
+     * i.e. table shards are roughly equal sized.  Based on this assumption
+     * we estimate scanning cost for an arbitrary shard using statistics
+     * collected for a local partition.
+     */
+    fpinfo->localpartrel = build_localpart_rel(root, relname);
 
 	/*
 	 * Extract user-settable option values.  Note that per-table setting of
