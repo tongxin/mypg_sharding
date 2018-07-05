@@ -11,7 +11,6 @@
  */
 #include "postgres.h"
 
-#include "postgres_fdw.h"
 #include "mypg_config.h"
 
 #include "access/htup_details.h"
@@ -24,10 +23,13 @@
 #include "commands/explain.h"
 #include "commands/vacuum.h"
 #include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/relation.h"
 #include "optimizer/cost.h"
 #include "optimizer/clauses.h"
 #include "optimizer/pathnode.h"
@@ -43,16 +45,17 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
 
 PG_MODULE_MAGIC;
 
 /* Default CPU cost to start up a foreign query. */
-#define DEFAULT_FDW_STARTUP_COST	100.0
+#define DEFAULT_FDW_STARTUP_COST 100.0
 
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
-#define DEFAULT_FDW_TUPLE_COST		0.01
+#define DEFAULT_FDW_TUPLE_COST 0.01
 
 /* If no remote estimates, assume a sort costs 20% extra */
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
@@ -118,19 +121,18 @@ enum FdwDirectModifyPrivateIndex
  */
 typedef struct PgFdwState
 {
-	Relation	rel;			/* relcache entry for the foreign table. NULL
+	Relation rel;			  /* relcache entry for the foreign table. NULL
 								 * for a foreign join scan. */
-	TupleDesc	tupdesc;		/* tuple descriptor of scan */
-	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
+	TupleDesc tupdesc;		  /* tuple descriptor of scan */
+	AttInMetadata *attinmeta; /* attribute datatype conversion metadata */
 
 	/* extracted fdw_private data */
-	char	   *query;			/* text of SELECT command */
-	List	   *retrieved_attrs;	/* list of retrieved attribute numbers */
+	char *query;		   /* text of SELECT command */
+	List *retrieved_attrs; /* list of retrieved attribute numbers */
 
 	/* for remote query execution */
-    
-} PgFdwState;
 
+} PgFdwState;
 
 /*
  * SQL functions
@@ -141,72 +143,72 @@ PG_FUNCTION_INFO_V1(mypg_fdw_handler);
  * FDW callback routines
  */
 static void GetForeignRelSize(PlannerInfo *root,
-						  RelOptInfo *baserel,
-						  Oid foreigntableid);
-static void postgresGetForeignPaths(PlannerInfo *root,
-						RelOptInfo *baserel,
-						Oid foreigntableid);
-static ForeignScan *postgresGetForeignPlan(PlannerInfo *root,
-					   RelOptInfo *foreignrel,
-					   Oid foreigntableid,
-					   ForeignPath *best_path,
-					   List *tlist,
-					   List *scan_clauses,
-					   Plan *outer_plan);
-static void postgresBeginForeignScan(ForeignScanState *node, int eflags);
-static TupleTableSlot *postgresIterateForeignScan(ForeignScanState *node);
-static void postgresReScanForeignScan(ForeignScanState *node);
-static void postgresEndForeignScan(ForeignScanState *node);
-static void postgresAddForeignUpdateTargets(Query *parsetree,
-								RangeTblEntry *target_rte,
-								Relation target_relation);
-static List *postgresPlanForeignModify(PlannerInfo *root,
-						  ModifyTable *plan,
-						  Index resultRelation,
-						  int subplan_index);
-static void postgresBeginForeignModify(ModifyTableState *mtstate,
-						   ResultRelInfo *resultRelInfo,
-						   List *fdw_private,
-						   int subplan_index,
-						   int eflags);
-static TupleTableSlot *postgresExecForeignInsert(EState *estate,
-						  ResultRelInfo *resultRelInfo,
-						  TupleTableSlot *slot,
-						  TupleTableSlot *planSlot);
-static TupleTableSlot *postgresExecForeignUpdate(EState *estate,
-						  ResultRelInfo *resultRelInfo,
-						  TupleTableSlot *slot,
-						  TupleTableSlot *planSlot);
-static TupleTableSlot *postgresExecForeignDelete(EState *estate,
-						  ResultRelInfo *resultRelInfo,
-						  TupleTableSlot *slot,
-						  TupleTableSlot *planSlot);
-static void postgresEndForeignModify(EState *estate,
-						 ResultRelInfo *resultRelInfo);
-static void postgresBeginForeignInsert(ModifyTableState *mtstate,
-						   ResultRelInfo *resultRelInfo);
-static void postgresEndForeignInsert(EState *estate,
-						 ResultRelInfo *resultRelInfo);
-static int	postgresIsForeignRelUpdatable(Relation rel);
-static bool postgresPlanDirectModify(PlannerInfo *root,
-						 ModifyTable *plan,
-						 Index resultRelation,
-						 int subplan_index);
-static void postgresBeginDirectModify(ForeignScanState *node, int eflags);
-static TupleTableSlot *postgresIterateDirectModify(ForeignScanState *node);
-static void postgresEndDirectModify(ForeignScanState *node);
-static void postgresExplainForeignScan(ForeignScanState *node,
-						   ExplainState *es);
-static void postgresExplainForeignModify(ModifyTableState *mtstate,
-							 ResultRelInfo *rinfo,
-							 List *fdw_private,
-							 int subplan_index,
-							 ExplainState *es);
-static void postgresExplainDirectModify(ForeignScanState *node,
-							ExplainState *es);
-static bool postgresAnalyzeForeignTable(Relation relation,
-							AcquireSampleRowsFunc *func,
-							BlockNumber *totalpages);
+							  RelOptInfo *baserel,
+							  Oid foreigntableid);
+static void GetForeignPaths(PlannerInfo *root,
+							RelOptInfo *baserel,
+							Oid foreigntableid);
+static ForeignScan *GetForeignPlan(PlannerInfo *root,
+								   RelOptInfo *foreignrel,
+								   Oid foreigntableid,
+								   ForeignPath *best_path,
+								   List *tlist,
+								   List *scan_clauses,
+								   Plan *outer_plan);
+// static void postgresBeginForeignScan(ForeignScanState *node, int eflags);
+// static TupleTableSlot *postgresIterateForeignScan(ForeignScanState *node);
+// static void postgresReScanForeignScan(ForeignScanState *node);
+// static void postgresEndForeignScan(ForeignScanState *node);
+// static void postgresAddForeignUpdateTargets(Query *parsetree,
+// 											RangeTblEntry *target_rte,
+// 											Relation target_relation);
+// static List *postgresPlanForeignModify(PlannerInfo *root,
+// 									   ModifyTable *plan,
+// 									   Index resultRelation,
+// 									   int subplan_index);
+// static void postgresBeginForeignModify(ModifyTableState *mtstate,
+// 									   ResultRelInfo *resultRelInfo,
+// 									   List *fdw_private,
+// 									   int subplan_index,
+// 									   int eflags);
+// static TupleTableSlot *postgresExecForeignInsert(EState *estate,
+// 												 ResultRelInfo *resultRelInfo,
+// 												 TupleTableSlot *slot,
+// 												 TupleTableSlot *planSlot);
+// static TupleTableSlot *postgresExecForeignUpdate(EState *estate,
+// 												 ResultRelInfo *resultRelInfo,
+// 												 TupleTableSlot *slot,
+// 												 TupleTableSlot *planSlot);
+// static TupleTableSlot *postgresExecForeignDelete(EState *estate,
+// 												 ResultRelInfo *resultRelInfo,
+// 												 TupleTableSlot *slot,
+// 												 TupleTableSlot *planSlot);
+// static void postgresEndForeignModify(EState *estate,
+// 									 ResultRelInfo *resultRelInfo);
+// static void postgresBeginForeignInsert(ModifyTableState *mtstate,
+// 									   ResultRelInfo *resultRelInfo);
+// static void postgresEndForeignInsert(EState *estate,
+// 									 ResultRelInfo *resultRelInfo);
+// static int postgresIsForeignRelUpdatable(Relation rel);
+// static bool postgresPlanDirectModify(PlannerInfo *root,
+// 									 ModifyTable *plan,
+// 									 Index resultRelation,
+// 									 int subplan_index);
+// static void postgresBeginDirectModify(ForeignScanState *node, int eflags);
+// static TupleTableSlot *postgresIterateDirectModify(ForeignScanState *node);
+// static void postgresEndDirectModify(ForeignScanState *node);
+// static void postgresExplainForeignScan(ForeignScanState *node,
+// 									   ExplainState *es);
+// static void postgresExplainForeignModify(ModifyTableState *mtstate,
+// 										 ResultRelInfo *rinfo,
+// 										 List *fdw_private,
+// 										 int subplan_index,
+// 										 ExplainState *es);
+// static void postgresExplainDirectModify(ForeignScanState *node,
+// 										ExplainState *es);
+// static bool postgresAnalyzeForeignTable(Relation relation,
+// 										AcquireSampleRowsFunc *func,
+// 										BlockNumber *totalpages);
 // static List *postgresImportForeignSchema(ImportForeignSchemaStmt *stmt,
 // 							Oid serverOid);
 // static void postgresGetForeignJoinPaths(PlannerInfo *root,
@@ -216,7 +218,7 @@ static bool postgresAnalyzeForeignTable(Relation relation,
 // 							JoinType jointype,
 // 							JoinPathExtraData *extra);
 static bool postgresRecheckForeignScan(ForeignScanState *node,
-						   TupleTableSlot *slot);
+									   TupleTableSlot *slot);
 // static void postgresGetForeignUpperPaths(PlannerInfo *root,
 // 							 UpperRelationKind stage,
 // 							 RelOptInfo *input_rel,
@@ -227,14 +229,14 @@ static bool postgresRecheckForeignScan(ForeignScanState *node,
  * to my callback routines.
  */
 Datum
-mypg_fdw_handler(PG_FUNCTION_ARGS)
+	mypg_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *routine = makeNode(FdwRoutine);
 
 	/* Functions for scanning foreign tables */
 	routine->GetForeignRelSize = GetForeignRelSize;
-	routine->GetForeignPaths = postgresGetForeignPaths;
-	routine->GetForeignPlan = postgresGetForeignPlan;
+	routine->GetForeignPaths = GetForeignPaths;
+	routine->GetForeignPlan = GetForeignPlan;
 	routine->BeginForeignScan = postgresBeginForeignScan;
 	routine->IterateForeignScan = postgresIterateForeignScan;
 	routine->ReScanForeignScan = postgresReScanForeignScan;
@@ -278,7 +280,6 @@ mypg_fdw_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(routine);
 }
 
-
 /*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
  * mypg_fdw foreign table.  For a baserel, this struct is created by
@@ -290,21 +291,21 @@ typedef struct RelationInfo
 	 * True means that the relation can be pushed down. Always true for simple
 	 * foreign scan.
 	 */
-	bool		pushdown_safe;
+	bool pushdown_safe;
 
 	/*
-	 * Restriction clauses, divided into safe and unsafe to pushdown subsets.
-	 * All entries in these lists should have RestrictInfo wrappers; that
-	 * improves efficiency of selectivity and cost estimation.
+	 * The distributed table is sharded on this column.
+	 */  
+	AttrNumber dist_keyatt;
+	/*
+	 * Restriction clauses are separated into shard and global. Local conditions 
+	 * are not allowed. Join clauses should not be present for the current design.
 	 */
-	List	   *remote_conds;
-	List	   *local_conds;
-
-	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
-	List	   *final_remote_exprs;
+	List *shard_conds;
+	List *global_conds;
 
 	/* Bitmap of attr numbers we need to fetch from the remote server. */
-	Bitmapset  *attrs_used;
+	Bitmapset *attrs_used;
 
 	// /* Cost and selectivity of local_conds. */
 	// QualCost	local_conds_cost;
@@ -314,38 +315,38 @@ typedef struct RelationInfo
 	// Selectivity joinclause_sel;
 
 	/* Estimated size and cost for a scan or join. */
-	double		rows;
-	int			width;
-	Cost		startup_cost;
-	Cost		total_cost;
+	double rows;
+	int width;
+	Cost startup_cost;
+	Cost total_cost;
 	/* Costs excluding costs for transferring data from the foreign server */
-	Cost		rel_startup_cost;
-	Cost		rel_total_cost;
+	Cost rel_startup_cost;
+	Cost rel_total_cost;
 
 	/* Options extracted from catalogs. */
 	// bool		use_remote_estimate;
-	Cost		fdw_startup_cost;
-	Cost		fdw_tuple_cost;
+	Cost fdw_startup_cost;
+	Cost fdw_tuple_cost;
 
 	/* Cached catalog information. */
 	ForeignTable *table;
 	ForeignServer *server;
-	UserMapping *user;			/* only set in use_remote_estimate mode */
+	UserMapping *user; /* only set in use_remote_estimate mode */
 
-	int			fetch_size;		/* fetch size for this remote table */
+	int fetch_size; /* fetch size for this remote table */
 
 	/*
 	 * Name of the relation while EXPLAINing ForeignScan. It is used for join
 	 * relations but is set for all relations. For join relation, the name
 	 * indicates which foreign tables are being joined and the join type used.
 	 */
-	StringInfo	relation_name;
+	StringInfo relation_name;
 
-    /*
-     * The local partitions of a sharding table are regular relations. We may
-     * use them to facilitate planning. 
+	/*
+     * Holds local shard relation info which we'll use for cost estimation in
+	 * query planning.
      */
-    RelOptInfo *localpartrel;
+	RelOptInfo *shardrel;
 
 	// /* Join information */
 	// RelOptInfo *outerrel;
@@ -355,7 +356,7 @@ typedef struct RelationInfo
 	// List	   *joinclauses;	/* List of RestrictInfo */
 
 	/* Grouping information */
-	List	   *grouped_tlist;
+	List *grouped_tlist;
 
 	// /* Subquery information */
 	// bool		make_outerrel_subquery; /* do we deparse outerrel as a
@@ -373,16 +374,16 @@ typedef struct RelationInfo
 } RelationInfo;
 
 static Oid mypg_extension_oid;
+static Oid mypg_tables_relid;
 static Oid mypg_partitions_relid;
-
 
 static Oid
 get_extension_schema(Oid ext_oid)
 {
-	Oid			result;
-	Relation	rel;
+	Oid result;
+	Relation rel;
 	SysScanDesc scandesc;
-	HeapTuple	tuple;
+	HeapTuple tuple;
 	ScanKeyData entry[1];
 
 	rel = heap_open(ExtensionRelationId, AccessShareLock);
@@ -399,7 +400,7 @@ get_extension_schema(Oid ext_oid)
 
 	/* We assume that there can be at most one matching tuple */
 	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
+		result = ((Form_pg_extension)GETSTRUCT(tuple))->extnamespace;
 	else
 		result = InvalidOid;
 
@@ -410,70 +411,107 @@ get_extension_schema(Oid ext_oid)
 	return result;
 }
 
-void
-mypg_fdw_cache_init()
+void mypg_fdw_cache_init()
 {
-    /* initialize mypg relids */
-    Oid         ext_schema;
+	/* initialize mypg relids */
+	Oid ext_schema;
 
-    mypg_extension_oid = get_extension_oid(MYPG_EXTENSION_NAME, true);
-    ext_schema = get_extension_schema(mypg_extension_oid);
-    mypg_partitions_relid = get_relname_relid(MYPG_PARTITIONS, ext_schema);
+	mypg_extension_oid = get_extension_oid(MYPG_EXTENSION_NAME, true);
+	ext_schema = get_extension_schema(mypg_extension_oid);
+	mypg_tables_relid = get_relname_relid(MYPG_TABLES, ext_schema);
+	mypg_partitions_relid = get_relname_relid(MYPG_PARTITIONS, ext_schema);
 }
 
 /*
  * Foreward declarations of deparse functions
  */
-extern void classifyConditions(PlannerInfo *root,
-				   RelOptInfo *baserel,
-				   List *input_conds,
-				   List **remote_conds,
-				   List **local_conds);
-extern bool is_foreign_expr(PlannerInfo *root,
-				RelOptInfo *baserel,
-				Expr *expr);
+static void classifyConditions(PlannerInfo *root,
+							   RelOptInfo *baserel,
+							   List *input_conds,
+							   List **remote_conds,
+							   List **local_conds);
+static bool is_foreign_expr(PlannerInfo *root,
+							RelOptInfo *baserel,
+							Expr *expr);
+
+static AttrNumber
+get_relation_distribution_keyatt(const char *relname)
+{
+	Relation 	tables;
+	SysScanDesc scandesc;
+	HeapTuple   tuple;
+	text	   *sktext;
+	ScanKeyData entry[1];
+	bool		isnull;
+	AttrNumber	attnum;
+	Oid			ns;
+	Oid			relid;
+	Relation	rel;
+
+	tables = heap_open(mypg_tables_relid, AccessShareLock);
+	sktext = cstring_to_text(relname);
+	ScanKeyInit(&entry[0],
+				Anum_mypg_tables_relname,
+				BTEqualStrategyNumber,
+				F_TEXTEQ,
+				PointerGetDatum(sktext));
+	scandesc = systable_beginscan(tables, InvalidOid, false,
+								  NULL, 1, entry);
+	tuple = systable_getnext(scandesc);
+	if (HeapTupleIsValid(tuple))
+		attnum = heap_getattr(tuple, Anum_mypg_tables_distkey, 
+							  RelationGetDescr(tables), &isnull);
+	else
+		elog(ERROR, "mypg_fdw: relation %s does not relate to an entry in mypy.tables.", relname);
+
+	heap_close(mypg_tables_relid, AccessShareLock);
+	return attnum;
+	// ns = linitial_oid(fetch_search_path(false));
+	// relid = get_relname_relid(relname, ns);
+	// rel = heap_open(relid, AccessShareLock);
+}
 
 static RelOptInfo *
-build_localpart_rel(PlannerInfo *root, const char *relname)
+build_shardrel(PlannerInfo *root, RelOptInfo *baserel, const char *relname)
 {
-    /* Related to mypg.partitions */
-    Relation    parts;
+	/* Related to mypg.partitions */
+	Relation parts;
 	SysScanDesc scandesc;
-	HeapTuple	tuple;
-    text       *sktext;
+	HeapTuple tuple;
+	text *sktext;
 	ScanKeyData entry[1];
-    /* Related to local partition */
-    Oid         partid;
-    RelOptInfo *partrel;
+	/* Related to local partition */
+	Oid partid;
+	RelOptInfo *partrel;
 
-    parts = heap_open(mypg_partitions_relid, AccessShareLock);
+	parts = heap_open(mypg_partitions_relid, AccessShareLock);
 
-    sktext = cstring_to_text(relname);    
-    ScanKeyInit(&entry[0],
-                Anum_mypg_partitions_relname,
-                BTEqualStrategyNumber,
-                F_TEXTEQ,
-                PointerGetDatum(sktext));
+	sktext = cstring_to_text(relname);
+	ScanKeyInit(&entry[0],
+				Anum_mypg_partitions_relname,
+				BTEqualStrategyNumber,
+				F_TEXTEQ,
+				PointerGetDatum(sktext));
 
-    scandesc = systable_beginscan(parts, InvalidOid, false,
+	scandesc = systable_beginscan(parts, InvalidOid, false,
 								  NULL, 1, entry);
 
-    tuple = systable_getnext(scandesc);
+	tuple = systable_getnext(scandesc);
 	/* Pick the first matching tuple */
 	if (HeapTupleIsValid(tuple))
-		partid = ((Form_mypg_partitions) GETSTRUCT(tuple))->localid;
+		partid = ((Form_mypg_partitions)GETSTRUCT(tuple))->localid;
 	else
 		partid = InvalidOid;
 
-    partrel = makeNode(RelOptInfo);
-    partrel->reloptkind = RELOPT_OTHER_MEMBER_REL;
+	partrel = makeNode(RelOptInfo);
+	partrel->reloptkind = RELOPT_OTHER_MEMBER_REL;
 	partrel->relids = bms_make_singleton(partid);
 	partrel->rows = 0;
 	/* cheap startup cost is interesting iff not all tuples to be retrieved */
 	partrel->consider_startup = true;
-	partrel->consider_param_startup = false;	/* might get changed later */
-	partrel->consider_parallel = false; /* might get changed later */
-	partrel->reltarget = create_empty_pathtarget();
+	partrel->consider_param_startup = false; /* might get changed later */
+	partrel->consider_parallel = false;		 /* might get changed later */
+	partrel->reltarget = copy_pathtarget(baserel->reltablespace);
 	partrel->pathlist = NIL;
 	partrel->ppilist = NIL;
 	partrel->partial_pathlist = NIL;
@@ -503,7 +541,7 @@ build_localpart_rel(PlannerInfo *root, const char *relname)
 	partrel->fdw_private = NULL;
 	partrel->unique_for_rels = NIL;
 	partrel->non_unique_for_rels = NIL;
-	partrel->baserestrictinfo = NIL;
+	partrel->baserestrictinfo = list_copy(baserel->baserestrictinfo);
 	partrel->baserestrictcost.startup = 0;
 	partrel->baserestrictcost.per_tuple = 0;
 	partrel->baserestrict_min_security = UINT_MAX;
@@ -517,10 +555,12 @@ build_localpart_rel(PlannerInfo *root, const char *relname)
 	partrel->partexprs = NULL;
 	partrel->nullable_partexprs = NULL;
 	partrel->partitioned_child_rels = NIL;
-    partrel->top_parent_relids = NULL;
-    get_relation_info(root, partid, false, partrel);
+	partrel->top_parent_relids = NULL;
+	get_relation_info(root, partid, false, partrel);
 
-    return partrel;
+	heap_close(mypg_partitions_relid, AccessShareLock);
+
+	return partrel;
 }
 
 /*
@@ -535,17 +575,17 @@ GetForeignRelSize(PlannerInfo *root,
 				  Oid foreigntableid)
 {
 	RelationInfo *fpinfo;
-	ListCell   *lc;
+	ListCell *lc;
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
-    const char *namespace;
+	const char *namespace;
 	const char *relname;
 	const char *refname;
 
-    fpinfo = (RelationInfo *) palloc0(sizeof(RelationInfo));
-    baserel->fdw_private = (void *) fpinfo;
+	fpinfo = (RelationInfo *)palloc0(sizeof(RelationInfo));
+	baserel->fdw_private = (void *)fpinfo;
 
-    /* Base foreign tables need to be pushed down always. */
-    fpinfo->pushdown_safe = true;
+	/* Base foreign tables need to be pushed down always. */
+	fpinfo->pushdown_safe = true;
 
 	/* Look up foreign-table catalog info. */
 	fpinfo->table = GetForeignTable(foreigntableid);
@@ -567,14 +607,6 @@ GetForeignRelSize(PlannerInfo *root,
 	if (*refname && strcmp(refname, relname) != 0)
 		appendStringInfo(fpinfo->relation_name, " %s",
 						 quote_identifier(rte->eref->aliasname));
-
-    /* We don't consider data skew across table shards in query planning.
-     * i.e. table shards are roughly equal sized.  Based on this assumption
-     * we estimate scanning cost for an arbitrary shard using statistics
-     * collected for a local partition.
-     */
-    fpinfo->localpartrel = build_localpart_rel(root, relname);
-
 	/*
 	 * Extract user-settable option values.  Note that per-table setting of
 	 * use_remote_estimate overrides per-server setting.
@@ -584,34 +616,42 @@ GetForeignRelSize(PlannerInfo *root,
 	fpinfo->fetch_size = 100;
 
 	/*
+	 * Build distribution column for classifyConditions
+	 */
+	fpinfo->dist_keyatt = get_relation_distribution_keyatt(relname);
+	/*
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
 	 */
-	classifyConditions(root, baserel, baserel->baserestrictinfo,
-					   &fpinfo->remote_conds, &fpinfo->local_conds);
+	classifyConditions(root, baserel, fpinfo->dist_keyatt, baserel->baserestrictinfo,
+					   &fpinfo->shard_conds, &fpinfo->global_conds);
 
+	/* We don't consider data skew across table shards in query planning.
+     * i.e. table shards are roughly equal sized.  Based on this assumption
+     * we estimate scanning cost for an arbitrary shard using statistics
+     * collected for a local partition.
+     */
+	fpinfo->shardrel = build_shardrel(root, baserel, relname);
 	/*
 	 * Identify which attributes will need to be retrieved from the remote
 	 * server. Only consider simple column targets for now so no need to invoke 
      * expression_tree_walker.  
 	 */
 	fpinfo->attrs_used = NULL;
-    ListCell   *lc;
-    foreach(lc, baserel->reltarget->exprs)
-    {
-        Expr *node = (Expr*)lfirst(lc);
-        if (IsA(node, Var))
-        {
-            Var		   *var = (Var *) node;
-
-		    if (var->varno == baserel->relid && var->varlevelsup == 0)
-			    fpinfo->attrs_used = 
-                    bms_add_member(fpinfo->attrs_used, 
-                                   var->varattno - FirstLowInvalidHeapAttributeNumber);
-        }        
-        Assert(!IsA(node, Query));
-    }
-    
+	ListCell *lc;
+	foreach (lc, baserel->reltarget->exprs)
+	{
+		Expr *node = (Expr *)lfirst(lc);
+		if (IsA(node, Var))
+		{
+			Var *var = (Var *)node;
+			if (var->varno == baserel->relid && var->varlevelsup == 0)
+				fpinfo->attrs_used =
+					bms_add_member(fpinfo->attrs_used,
+								   var->varattno - FirstLowInvalidHeapAttributeNumber);
+		}
+		Assert(!IsA(node, Query));
+	}
 	/*
 	 * Set cached relation costs to some negative value, so that we can detect
 	 * when they are set to some sensible costs during one (usually the first)
@@ -619,100 +659,224 @@ GetForeignRelSize(PlannerInfo *root,
 	 */
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;
-
 	/*
-	 * We consider queries with restrictions on the partitioning column only,
-     * so the cost of a scan is estimated against an average partition.
+	 * We estimate the rows and width of scanning by checking against local
+	 * partition info.
 	 */
-    set_dummy_rel_pathlist(baserel);
-    baserel->rows = clamp_row_est(baserel->rows);
-    
+	Cost startup_cost;
+	Cost row_cost;
+	Cost total_cost;
+	set_baserel_size_estimates(root, fpinfo->shardrel);
+	fpinfo->rows = fpinfo->shardrel->rows;
+	fpinfo->width = fpinfo->shardrel->reltarget->width;
+	startup_cost = fpinfo->shardrel->reltarget->cost.startup;
+	row_cost = fpinfo->shardrel->reltarget->cost.per_tuple;
+	total_cost = startup_cost + row_cost * fpinfo->rows;
+
+	fpinfo->startup_cost = fpinfo->fdw_startup_cost + startup_cost;
+	fpinfo->total_cost = total_cost + fpinfo->fdw_tuple_cost * fpinfo->rows;
+	baserel->rows = fpinfo->rows;
+	baserel->reltarget->width = fpinfo->width;
+
+	return;
 }
 
+static void
+GetForeignPaths(PlannerInfo *root,
+				RelOptInfo *baserel,
+				Oid foreigntableid)
+{
+	RelationInfo *fpinfo = (RelationInfo *)baserel->fdw_private;
+	ForeignPath *path;
+	List *ppi_list;
+	ListCell *lc;
 
-#define REL_ALIAS_PREFIX	"r"
+	/*
+	 * Create simplest ForeignScan path node and add it to baserel.  This path
+	 * corresponds to SeqScan path of regular tables (though depending on what
+	 * baserestrict conditions we were able to send to remote, there might
+	 * actually be an indexscan happening there).  We already did all the work
+	 * to estimate cost and size of this path.
+	 */
+	path = create_foreignscan_path(root, baserel,
+								   NULL, /* default pathtarget */
+								   fpinfo->rows,
+								   fpinfo->startup_cost,
+								   fpinfo->total_cost,
+								   NIL,  /* no pathkeys */
+								   NULL, /* no outer rel either */
+								   NULL, /* no extra plan */
+								   NIL); /* no fdw_private list */
+	add_path(baserel, (Path *)path);
+
+	/* Add paths with pathkeys */
+	add_paths_with_pathkeys_for_rel(root, baserel, NULL);
+}
+
+static ForeignScan *
+GetForeignPlan(PlannerInfo *root,
+			   RelOptInfo *foreignrel,
+			   Oid foreigntableid,
+			   ForeignPath *best_path,
+			   List *tlist,
+			   List *scan_clauses,
+			   Plan *outer_plan)
+{
+	RelationInfo *fpinfo = (RelationInfo *)foreignrel->fdw_private;
+	Index scan_relid;
+	List *fdw_private;
+	List *remote_exprs = NIL;
+	List *local_exprs = NIL;
+	List *params_list = NIL;
+	List *fdw_scan_tlist = NIL;
+	List *fdw_recheck_quals = NIL;
+	List *retrieved_attrs;
+	StringInfoData sql;
+	ListCell *lc;
+
+	if (!IS_SIMPLE_REL(foreignrel))
+		 ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("mypg_fdw: shard table is not simple relation.")));
+
+	scan_relid = foreignrel->relid;
+
+	/*
+		 * In a base-relation scan, we must apply the given scan_clauses.
+		 *
+		 * Separate the scan_clauses into those that can be executed remotely
+		 * and those that can't.  baserestrictinfo clauses that were
+		 * previously determined to be safe or unsafe by classifyConditions
+		 * are found in fpinfo->remote_conds and fpinfo->local_conds. Anything
+		 * else in the scan_clauses list will be a join clause, which we have
+		 * to check for remote-safety.
+		 *
+		 * Note: the join clauses we see here should be the exact same ones
+		 * previously examined by GetForeignPaths.  Possibly it'd be
+		 * worth passing forward the classification work done then, rather
+		 * than repeating it here.
+		 *
+		 * This code must match "extract_actual_clauses(scan_clauses, false)"
+		 * except for the additional decision about remote versus local
+		 * execution.
+		 */
+	foreach (lc, scan_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		/* Ignore any pseudoconstants, they're dealt with elsewhere */
+		if (rinfo->pseudoconstant)
+			continue;
+
+		if (list_member_ptr(fpinfo->remote_conds, rinfo))
+			remote_exprs = lappend(remote_exprs, rinfo->clause);
+		else if (list_member_ptr(fpinfo->local_conds, rinfo))
+			local_exprs = lappend(local_exprs, rinfo->clause);
+		else if (is_foreign_expr(root, foreignrel, rinfo->clause))
+			remote_exprs = lappend(remote_exprs, rinfo->clause);
+		else
+			local_exprs = lappend(local_exprs, rinfo->clause);
+	}
+	
+	
+	/*
+		 * For a base-relation scan, we have to support EPQ recheck, which
+		 * should recheck all the remote quals.
+		 */
+	fdw_recheck_quals = remote_exprs;
+}
+
+#define REL_ALIAS_PREFIX "r"
 /* Handy macro to add relation name qualification */
-#define ADD_REL_QUALIFIER(buf, varno)	\
-		appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
-#define SUBQUERY_REL_ALIAS_PREFIX	"s"
-#define SUBQUERY_COL_ALIAS_PREFIX	"c"
-
+#define ADD_REL_QUALIFIER(buf, varno) \
+	appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
+#define SUBQUERY_REL_ALIAS_PREFIX "s"
+#define SUBQUERY_COL_ALIAS_PREFIX "c"
 
 /*
  * Examine each qual clause in input_conds, and classify them into two groups,
  * which are returned as two lists:
- *	- remote_conds contains expressions that can be evaluated remotely
- *	- local_conds contains expressions that can't be evaluated remotely
+ *	- shard_conds contains expressions that can be evaluated on a single shard
+ *	- global_conds contains expressions that should be evaluated on all shards.
  */
-void
-classifyConditions(PlannerInfo *root,
-				   RelOptInfo *baserel,
-				   List *input_conds,
-				   List **remote_conds,
-				   List **local_conds)
+void classifyConditions(PlannerInfo *root,
+						AttrNumber distkey_att,
+						RelOptInfo *baserel,
+						List *input_conds,
+						List **shard_conds,
+						List **global_conds)
 {
-	ListCell   *lc;
+	ListCell *lc;
 
-	*remote_conds = NIL;
-	*local_conds = NIL;
+	*shard_conds = NIL;
+	*global_conds = NIL;
 
-	foreach(lc, input_conds)
+	foreach (lc, input_conds)
 	{
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
-
-		if (is_foreign_expr(root, baserel, ri->clause))
-			*remote_conds = lappend(*remote_conds, ri);
+		
+		if (is_shard_expr(baserel, distkey_att, ri->clause))
+			*shard_conds = lappend(*shard_conds, ri);
 		else
-			*local_conds = lappend(*local_conds, ri);
+			*global_conds = lappend(*global_conds, ri);
 	}
 }
 
 /*
  * Returns true if given expr is safe to evaluate on the foreign server.
  */
-bool
-is_foreign_expr(PlannerInfo *root,
-				RelOptInfo *baserel,
-				Expr *expr)
+static bool
+is_shard_expr(RelOptInfo *baserel, AttrNumber distkey_att, Node *expr)
 {
-	RelationInfo *fpinfo = (RelationInfo *) (baserel->fdw_private);
+	RelationInfo *fpinfo = (RelationInfo *)(baserel->fdw_private);
 
-    if (expr == NULL)
-        return true;
+	if (expr == NULL)
+		return true;
 
 	/*
 	 * Current sharding solutions do not support aggregations so we don't 
      * care about upper relations. 
 	 */
-    switch (nodeTag(expr))
-    {
-        case T_Var:
-        {
-            Var *var = (Var *) expr;
+	switch (nodeTag(expr))
+	{
+	case T_Var:
+	{
+		Var *var = (Var *)expr;
 
-            if (!bms_is_member(var->varno, baserel->relids))
-                elog(ERROR, "mypg_fdw: variable in restriction doesnt belong to a foreign table. ");
+		if (var->varno != baserel->relid)
+			elog(ERROR, "mypg_fdw: restriction variable does not reference foreign table. ");
 
-            break;
-        }
-        case T_Const:
-        {
-            break;
-        }
-        case T_BoolExpr:
-        {
-            BoolExpr   *b = (BoolExpr *) expr;
-            ListCell   *lc;
-            foreach(lc, b->args)
-            {
-                if (!is_foreign_expr(root, baserel, (Expr*)lfirst(lc)))
-                    return false;
-            }
-            break;
-        }
-        default:
-            elog(ERROR, "mypg_fdw: unsupported type found in restriction expression. ");
-    }
+		return var->varattno == distkey_att ? true : false;
+	}
+	case T_Const:
+	{
+		break;
+	}
+	case T_BoolExpr:
+	{
+		BoolExpr *b = (BoolExpr *)expr;
+		ListCell *lc;
+		foreach (lc, b->args)
+		{
+			if (!is_shard_expr(baserel, distkey_att, (Expr *)lfirst(lc)))
+				return false;
+		}
+		break;
+	}
+	case T_NullTest:
+	{
+		NullTest *nt = (NullTest *)expr;
+
+		/*
+		 * Recurse to input subexpressions.
+		 */
+		if (!is_shard_expr(baserel, distkey_att, (Expr *)nt->arg))
+			return false;
+	}
+	break;
+	default:
+		elog(ERROR, "mypg_fdw: unsupported type found in restriction expression. ");
+	}
 
 	/*
 	 * An expression which includes any mutable functions can't be sent over
@@ -721,7 +885,7 @@ is_foreign_expr(PlannerInfo *root,
 	 * be able to make this choice with more granularity.  (We check this last
 	 * because it requires a lot of expensive catalog lookups.)
 	 */
-	if (contain_mutable_functions((Node *) expr))
+	if (contain_mutable_functions((Node *)expr))
 		return false;
 
 	/* OK to evaluate on the remote server */

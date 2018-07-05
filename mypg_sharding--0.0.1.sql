@@ -28,36 +28,36 @@ $$;
 
 -- Node state
 CREATE TABLE nodestate (
-	node_name text NOT NULL,       -- the node name
-	current text NOT NULL,         -- local node state: INIT, ACTIVE, or INACTIVE
+	node_name char(64) NOT NULL,   -- the node name
+	current char(16) NOT NULL,         -- local node state: INIT, ACTIVE, or INACTIVE
 	epoch integer NOT NULL         -- starting from 1, increased everytime a cluster configuration change occurs 
 );
 
 -- Server nodes
 CREATE TABLE cluster_nodes (
-	node_name text NOT NULL UNIQUE,
+	node_name char(64) NOT NULL UNIQUE,
 	system_id bigint NOT NULL UNIQUE,
-	host text NOT NULL,
-	port text NOT NULL,
-	dbname text NOT NULL,
+	host char(64) NOT NULL,
+	port char(8) NOT NULL,
+	dbname char(64) NOT NULL,
 	UNIQUE (host, port)
 );
 
 -- Distributed tables
 CREATE TABLE tables (
-	relname text PRIMARY KEY,      -- table name
-	partcol text,                  -- sharding key column
-	modulo integer,                -- maximum number of distributed partitions
-	create_sql text NOT NULL,      -- sql to create the table
+	relname char(64) PRIMARY KEY,   -- table name
+	distkey smallint,               -- attribute number of the sharding key column
+	modulo smallint,                -- maximum number of distributed partitions
 	rows_est real,
-	width_est int,
-	tuples  real
+	width_est smallint,
+	tuples  real,
+	create_sql text NOT NULL       -- sql to create the table
 --	create_rules_sql text          -- sql to create rules for shared table
 );
 
 CREATE TABLE partitions (
 	localid Oid,                   -- Local oid of the partition table
-	relname text,                  -- table name
+	relname char(64),              -- table name
 	p int,                         -- partition index
 	node text                      -- the node at which the partition is allocated
 );
