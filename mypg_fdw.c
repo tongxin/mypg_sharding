@@ -303,6 +303,10 @@ typedef struct RelationInfo
 	 */
 	List *shard_conds;
 	List *global_conds;
+	List *local_conds;
+	
+	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
+	List	   *final_remote_exprs;
 
 	/* Bitmap of attr numbers we need to fetch from the remote server. */
 	Bitmapset *attrs_used;
@@ -426,10 +430,12 @@ void mypg_fdw_cache_init()
  * Foreward declarations of deparse functions
  */
 static void classifyConditions(PlannerInfo *root,
-							   RelOptInfo *baserel,
-							   List *input_conds,
-							   List **remote_conds,
-							   List **local_conds);
+							AttrNumber distkey_att,
+							RelOptInfo *baserel,
+							List *input_conds,
+							List **shard_conds,
+							List **global_conds,
+							List **local_conds);
 static bool is_foreign_expr(PlannerInfo *root,
 							RelOptInfo *baserel,
 							Expr *expr);
@@ -624,7 +630,7 @@ GetForeignRelSize(PlannerInfo *root,
 	 * server and which can't.
 	 */
 	classifyConditions(root, baserel, fpinfo->dist_keyatt, baserel->baserestrictinfo,
-					   &fpinfo->shard_conds, &fpinfo->global_conds);
+					   &fpinfo->shard_conds, &fpinfo->global_conds, &fpinfo->local_conds);
 
 	/* We don't consider data skew across table shards in query planning.
      * i.e. table shards are roughly equal sized.  Based on this assumption
@@ -768,22 +774,186 @@ GetForeignPlan(PlannerInfo *root,
 		if (rinfo->pseudoconstant)
 			continue;
 
-		if (list_member_ptr(fpinfo->remote_conds, rinfo))
-			remote_exprs = lappend(remote_exprs, rinfo->clause);
-		else if (list_member_ptr(fpinfo->local_conds, rinfo))
-			local_exprs = lappend(local_exprs, rinfo->clause);
-		else if (is_foreign_expr(root, foreignrel, rinfo->clause))
+		if (list_member_ptr(fpinfo->shard_conds, rinfo)
+			|| list_member_ptr(fpinfo->global_conds, rinfo))
 			remote_exprs = lappend(remote_exprs, rinfo->clause);
 		else
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
-	
-	
 	/*
-		 * For a base-relation scan, we have to support EPQ recheck, which
-		 * should recheck all the remote quals.
-		 */
+	 * For a base-relation scan, we have to support EPQ recheck, which
+	 * should recheck all the remote quals.
+	 */
 	fdw_recheck_quals = remote_exprs;
+
+	/*
+	 * Build the query string to be sent for execution, and identify
+	 * expressions to be sent as parameters.
+	 */
+	initStringInfo(&sql);
+	deparseSimpleSelectStmt(&sql, root, foreignrel, remote_exprs,
+							best_path->path.pathkeys,
+							&retrieved_attrs, &params_list);
+	/* Remember remote_exprs for possible use by postgresPlanDirectModify */
+	fpinfo->final_remote_exprs = remote_exprs;
+
+	/*
+	 * Build the fdw_private list that will be available to the executor.
+	 * Items in the list must match order in enum FdwScanPrivateIndex.
+	 */
+	fdw_private = list_make3(makeString(sql.data),
+							 retrieved_attrs,
+							 makeInteger(fpinfo->fetch_size));
+
+	/*
+	 * Create the ForeignScan node for the given relation.
+	 *
+	 * Note that the remote parameter expressions are stored in the fdw_exprs
+	 * field of the finished plan node; we can't keep them in private state
+	 * because then they wouldn't be subject to later planner processing.
+	 */
+	return make_foreignscan(tlist,
+							local_exprs,
+							scan_relid,
+							params_list,
+							fdw_private,
+							fdw_scan_tlist,
+							fdw_recheck_quals,
+							outer_plan);
+}
+
+static void
+deparseSelectTargets(StringInfo buf,
+				  RangeTblEntry *rte,
+				  Index rtindex,
+				  Relation rel,
+				  bool is_returning,
+				  Bitmapset *attrs_used,
+				  bool qualify_col,
+				  List **retrieved_attrs)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	bool		have_wholerow;
+	bool		first;
+	int			i;
+
+	*retrieved_attrs = NIL;
+
+	/* If there's a whole-row reference, we'll need all the columns. */
+	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
+								  attrs_used);
+
+	first = true;
+	for (i = 1; i <= tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+
+		/* Ignore dropped attributes. */
+		if (attr->attisdropped)
+			continue;
+
+		if (have_wholerow ||
+			bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
+						  attrs_used))
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			else if (is_returning)
+				appendStringInfoString(buf, " RETURNING ");
+			first = false;
+
+			deparseColumnRef(buf, rtindex, i, rte, qualify_col);
+
+			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
+		}
+	}
+	/* Don't generate bad syntax if no undropped columns */
+	if (first && !is_returning)
+		appendStringInfoString(buf, "NULL");
+}
+
+static void
+deparseSimpleSelectStmt(StringInfo buf, PlannerInfo *root, RelOptInfo *relopt,
+						List *remote_conds, List *pathkeys,
+						List **retrieved_attrs, List **params_list)
+{
+	RelationInfo   *fpinfo;
+	RangeTblEntry  *rte;
+	Relation 		rel;
+	bool			is_first = true;
+	char	   	   *delim = " ";
+
+	fpinfo = (RelationInfo *) relopt->fdw_private;
+
+	appendStringInfoString(buf, "SELECT ");
+	/*
+	 * For a base relation fpinfo->attrs_used gives the list of columns
+	 * required to be fetched from the foreign server.
+	 */
+	rte = planner_rt_fetch(relopt->relid, root);
+
+	rel = heap_open(rte->relid, NoLock);
+
+	deparseSelectTargets(buf, rte, relopt->relid, rel, false,
+					  	 fpinfo->attrs_used, false, retrieved_attrs);
+
+	/* Construct FROM clause */
+	appendStringInfoString(buf, " FROM ");
+
+	deparseRelation(buf, rel);
+
+	heap_close(rel, NoLock);
+
+	if (remote_conds != NIL)
+	{
+		appendStringInfoString(buf, " WHERE ");
+	}
+
+	foreach(lc, remote_conds)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+
+		/* Extract clause from RestrictInfo, if required */
+		if (IsA(expr, RestrictInfo))
+			expr = ((RestrictInfo *) expr)->clause;
+
+		/* Connect expressions with "AND" and parenthesize each condition. */
+		if (!is_first)
+			appendStringInfoString(buf, " AND ");
+
+		appendStringInfoChar(buf, '(');
+		deparseExpr(expr, context);
+		appendStringInfoChar(buf, ')');
+
+		is_first = false;
+	}
+
+	/* Add ORDER BY clause if we found any useful pathkeys */
+	if (pathkeys)
+		appendStringInfoString(buf, " ORDER BY");
+	
+	foreach(lcell, pathkeys)
+	{
+		PathKey    *pathkey = lfirst(lcell);
+		Expr	   *em_expr;
+
+		em_expr = find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+		Assert(em_expr != NULL);
+
+		appendStringInfoString(buf, delim);
+		deparseExpr(em_expr, context);
+		if (pathkey->pk_strategy == BTLessStrategyNumber)
+			appendStringInfoString(buf, " ASC");
+		else
+			appendStringInfoString(buf, " DESC");
+
+		if (pathkey->pk_nulls_first)
+			appendStringInfoString(buf, " NULLS FIRST");
+		else
+			appendStringInfoString(buf, " NULLS LAST");
+
+		delim = ", ";
+	}
 }
 
 #define REL_ALIAS_PREFIX "r"
@@ -792,6 +962,93 @@ GetForeignPlan(PlannerInfo *root,
 	appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
 #define SUBQUERY_REL_ALIAS_PREFIX "s"
 #define SUBQUERY_COL_ALIAS_PREFIX "c"
+
+/*
+ * Examine an expression to decide where it should be evaluated: on one shard, on all
+ * shards, or locally. The recursive algorithm works by decrementing the value passed
+ * in by c when we determine the expression can't be evaluated on one shard or can't
+ * even remotely.
+ */
+static void
+walk_foreign_expr(RelOptInfo *baserel, AttrNumber distkey_att, Node *expr, int *c)
+{
+	if (expr == NULL)
+		return;
+
+	/*
+	 * Current sharding solutions do not support aggregations and we only care about
+	 * equal conditions.
+	 */
+	switch (nodeTag(expr))
+	{
+	case T_Var:
+	{
+		Var *var = (Var *)expr;
+
+		if (var->varno != baserel->relid)
+			*c = 0;
+		else if (*c == 2 && var->varattno != distkey_att)
+			(*c)--;
+
+		return;
+	}
+	case T_Const:
+	{
+		return;
+	}
+	case T_BoolExpr:
+	{
+		BoolExpr *b = (BoolExpr *)expr;
+		ListCell *lc;
+
+		if (*c == 2)
+			(*c)--;
+
+		foreach (lc, b->args)
+		{
+			walk_foreign_expr(baserel, distkey_att, (Node *)lfirst(lc), c);
+			if (*c == 0)
+				return;
+		}
+		return;
+	}
+	case T_OpExpr:
+	case T_DistinctExpr:
+	{
+		/* For now only consider equal operators */
+		OpExpr	   *oe = (OpExpr *) expr;
+
+		walk_foreign_expr(baserel, distkey_att, (Node *)oe->args, c);
+		return;
+	}
+	case T_List:
+	{
+		List	   *l = (List *) expr;
+		ListCell   *lc;
+
+		foreach(lc, l)
+		{
+ 			walk_foreign_expr(baserel, distkey_att, (Node *)lfirst(lc), c);
+			if (*c == 0)
+				return;
+		}
+		return;
+	}
+	case T_NullTest:
+	{
+		NullTest *nt = (NullTest *)expr;
+
+		walk_foreign_expr(baserel, distkey_att, (Node *)nt->arg, c);
+		return;
+	}
+	default:
+		elog(ERROR, "mypg_fdw: unsupported type found in restriction expression. ");
+	}
+
+	/* OK to evaluate on the remote server */
+	return;
+}
+
 
 /*
  * Examine each qual clause in input_conds, and classify them into two groups,
@@ -804,90 +1061,28 @@ void classifyConditions(PlannerInfo *root,
 						RelOptInfo *baserel,
 						List *input_conds,
 						List **shard_conds,
-						List **global_conds)
+						List **global_conds,
+						List **local_conds)
 {
-	ListCell *lc;
+	ListCell       *lc;
 
-	*shard_conds = NIL;
+	*shard_conds  = NIL;
 	*global_conds = NIL;
+	*local_conds  = NIL;
 
 	foreach (lc, input_conds)
 	{
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		int c = 2;
+
+		c = walk_foreign_expr(baserel, distkey_att, ri->clause, &c);
 		
-		if (is_shard_expr(baserel, distkey_att, ri->clause))
+		if (c == 2)
 			*shard_conds = lappend(*shard_conds, ri);
-		else
+		else if (c == 1)
 			*global_conds = lappend(*global_conds, ri);
+		else
+			*local_conds = lappend(*local_conds, ri);
 	}
 }
 
-/*
- * Returns true if given expr is safe to evaluate on the foreign server.
- */
-static bool
-is_shard_expr(RelOptInfo *baserel, AttrNumber distkey_att, Node *expr)
-{
-	RelationInfo *fpinfo = (RelationInfo *)(baserel->fdw_private);
-
-	if (expr == NULL)
-		return true;
-
-	/*
-	 * Current sharding solutions do not support aggregations so we don't 
-     * care about upper relations. 
-	 */
-	switch (nodeTag(expr))
-	{
-	case T_Var:
-	{
-		Var *var = (Var *)expr;
-
-		if (var->varno != baserel->relid)
-			elog(ERROR, "mypg_fdw: restriction variable does not reference foreign table. ");
-
-		return var->varattno == distkey_att ? true : false;
-	}
-	case T_Const:
-	{
-		break;
-	}
-	case T_BoolExpr:
-	{
-		BoolExpr *b = (BoolExpr *)expr;
-		ListCell *lc;
-		foreach (lc, b->args)
-		{
-			if (!is_shard_expr(baserel, distkey_att, (Expr *)lfirst(lc)))
-				return false;
-		}
-		break;
-	}
-	case T_NullTest:
-	{
-		NullTest *nt = (NullTest *)expr;
-
-		/*
-		 * Recurse to input subexpressions.
-		 */
-		if (!is_shard_expr(baserel, distkey_att, (Expr *)nt->arg))
-			return false;
-	}
-	break;
-	default:
-		elog(ERROR, "mypg_fdw: unsupported type found in restriction expression. ");
-	}
-
-	/*
-	 * An expression which includes any mutable functions can't be sent over
-	 * because its result is not stable.  For example, sending now() remote
-	 * side could cause confusion from clock offsets.  Future versions might
-	 * be able to make this choice with more granularity.  (We check this last
-	 * because it requires a lot of expensive catalog lookups.)
-	 */
-	if (contain_mutable_functions((Node *)expr))
-		return false;
-
-	/* OK to evaluate on the remote server */
-	return true;
-}
