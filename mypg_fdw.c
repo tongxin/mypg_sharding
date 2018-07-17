@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "mypg_fdw.h"
 #include "mypg_config.h"
 
 #include "access/htup_details.h"
@@ -119,20 +120,32 @@ enum FdwDirectModifyPrivateIndex
 /*
  * Execution state
  */
-typedef struct PgFdwState
+typedef struct MypgScanState
 {
-	Relation rel;			  /* relcache entry for the foreign table. NULL
-								 * for a foreign join scan. */
-	TupleDesc tupdesc;		  /* tuple descriptor of scan */
-	AttInMetadata *attinmeta; /* attribute datatype conversion metadata */
+	Relation rel;					/* relcache entry for the foreign table. NULL
+									 * for a foreign join scan. */
+	TupleDesc 		tupdesc;		/* tuple descriptor of scan */
+	AttInMetadata  *attinmeta; 		/* attribute datatype conversion metadata */
 
 	/* extracted fdw_private data */
-	char *query;		   /* text of SELECT command */
-	List *retrieved_attrs; /* list of retrieved attribute numbers */
+	char 		   *query;		   	/* text of SELECT command */
+	List 		   *retrieved_attrs; /* list of retrieved attribute numbers */
 
 	/* for remote query execution */
+	PGconn 		   *cons;			/* array of connections */
+	int				cons_count;		/* number of connections */
 
-} PgFdwState;
+	/* for storing result tuples */
+	HeapTuple      *tuples;			/* array of currently-retrieved tuples */
+	int				num_tuples;		/* # of tuples in array */
+	int				next_tuple;		/* index of next one to return */
+
+	/* working memory contexts */
+	MemoryContext 	batch_cxt;		/* context holding current batch of tuples */
+	MemoryContext 	temp_cxt;		/* context for per-tuple temporary data */
+
+	int				fetch_size;		/* number of tuples per fetch */
+} MypgScanState;
 
 /*
  * SQL functions
@@ -237,7 +250,7 @@ Datum
 	routine->GetForeignRelSize = GetForeignRelSize;
 	routine->GetForeignPaths = GetForeignPaths;
 	routine->GetForeignPlan = GetForeignPlan;
-	routine->BeginForeignScan = postgresBeginForeignScan;
+	routine->BeginForeignScan = BeginForeignScan;
 	routine->IterateForeignScan = postgresIterateForeignScan;
 	routine->ReScanForeignScan = postgresReScanForeignScan;
 	routine->EndForeignScan = postgresEndForeignScan;
@@ -280,102 +293,7 @@ Datum
 	PG_RETURN_POINTER(routine);
 }
 
-/*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * mypg_fdw foreign table.  For a baserel, this struct is created by
- * postgresGetForeignRelSize, although some fields are not filled till later.
- */
-typedef struct RelationInfo
-{
-	/*
-	 * True means that the relation can be pushed down. Always true for simple
-	 * foreign scan.
-	 */
-	bool pushdown_safe;
 
-	/*
-	 * The distributed table is sharded on this column.
-	 */  
-	AttrNumber dist_keyatt;
-	/*
-	 * Restriction clauses are separated into shard and global. Local conditions 
-	 * are not allowed. Join clauses should not be present for the current design.
-	 */
-	List *shard_conds;
-	List *global_conds;
-	List *local_conds;
-	
-	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
-	List	   *final_remote_exprs;
-
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
-	Bitmapset *attrs_used;
-
-	// /* Cost and selectivity of local_conds. */
-	// QualCost	local_conds_cost;
-	// Selectivity local_conds_sel;
-
-	// /* Selectivity of join conditions */
-	// Selectivity joinclause_sel;
-
-	/* Estimated size and cost for a scan or join. */
-	double rows;
-	int width;
-	Cost startup_cost;
-	Cost total_cost;
-	/* Costs excluding costs for transferring data from the foreign server */
-	Cost rel_startup_cost;
-	Cost rel_total_cost;
-
-	/* Options extracted from catalogs. */
-	// bool		use_remote_estimate;
-	Cost fdw_startup_cost;
-	Cost fdw_tuple_cost;
-
-	/* Cached catalog information. */
-	ForeignTable *table;
-	ForeignServer *server;
-	UserMapping *user; /* only set in use_remote_estimate mode */
-
-	int fetch_size; /* fetch size for this remote table */
-
-	/*
-	 * Name of the relation while EXPLAINing ForeignScan. It is used for join
-	 * relations but is set for all relations. For join relation, the name
-	 * indicates which foreign tables are being joined and the join type used.
-	 */
-	StringInfo relation_name;
-
-	/*
-     * Holds local shard relation info which we'll use for cost estimation in
-	 * query planning.
-     */
-	RelOptInfo *shardrel;
-
-	// /* Join information */
-	// RelOptInfo *outerrel;
-	// RelOptInfo *innerrel;
-	// JoinType	jointype;
-	// /* joinclauses contains only JOIN/ON conditions for an outer join */
-	// List	   *joinclauses;	/* List of RestrictInfo */
-
-	/* Grouping information */
-	List *grouped_tlist;
-
-	// /* Subquery information */
-	// bool		make_outerrel_subquery; /* do we deparse outerrel as a
-	// 									 * subquery? */
-	// bool		make_innerrel_subquery; /* do we deparse innerrel as a
-	// 									 * subquery? */
-	// Relids		lower_subquery_rels;	/* all relids appearing in lower
-	// 									 * subqueries */
-
-	// /*
-	//  * Index of the relation.  It is used to create an alias to a subquery
-	//  * representing the relation.
-	//  */
-	// int			relation_index;
-} RelationInfo;
 
 static Oid mypg_extension_oid;
 static Oid mypg_tables_relid;
@@ -425,20 +343,6 @@ void mypg_fdw_cache_init()
 	mypg_tables_relid = get_relname_relid(MYPG_TABLES, ext_schema);
 	mypg_partitions_relid = get_relname_relid(MYPG_PARTITIONS, ext_schema);
 }
-
-/*
- * Foreward declarations of deparse functions
- */
-static void classifyConditions(PlannerInfo *root,
-							AttrNumber distkey_att,
-							RelOptInfo *baserel,
-							List *input_conds,
-							List **shard_conds,
-							List **global_conds,
-							List **local_conds);
-static bool is_foreign_expr(PlannerInfo *root,
-							RelOptInfo *baserel,
-							Expr *expr);
 
 static AttrNumber
 get_relation_distribution_keyatt(const char *relname)
@@ -820,6 +724,109 @@ GetForeignPlan(PlannerInfo *root,
 							fdw_scan_tlist,
 							fdw_recheck_quals,
 							outer_plan);
+}
+
+/*
+ * BeginForeignScan
+ *		Initiate an executor scan of a distributed table
+ */
+static void
+BeginForeignScan(ForeignScanState *node, int eflags)
+{
+	ForeignScan 	*plan = (ForeignScan *) node->ss.ps.plan;
+	EState	     	*estate = node->ss.ps.state;
+	MypgScanState 	*ss;
+	RangeTblEntry 	*rte;
+	Oid				userid;
+	ForeignTable 	*table;
+	UserMapping 	*user;
+	int				rtindex;
+	int				numParams;
+
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/*
+	 * We'll save private state in node->fdw_state.
+	 */
+	ss = (MypgScanState *) palloc0(sizeof(MypgScanState));
+	node->fdw_state = (void *) ss;
+
+	/*
+	 * Identify which user to do the remote access as.  This should match what
+	 * ExecCheckRTEPerms() does.  In case of a join or aggregate, use the
+	 * lowest-numbered member RTE as a representative; we would get the same
+	 * result from any.
+	 */
+	if (plan->scan.scanrelid > 0)
+		rtindex = plan->scan.scanrelid;
+	else
+		rtindex = bms_next_member(plan->fs_relids, -1);
+	rte = rt_fetch(rtindex, estate->es_range_table);
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+
+	/* Get info about foreign table. */
+	table = GetForeignTable(rte->relid);
+	user = GetUserMapping(userid, table->serverid);
+
+	/*
+	 * Get all the connections to the other data nodes.  Connection manager will
+	 * establish new connections if necessary.
+	 */
+	ss->cons = GetConnections(user, false);
+
+	/* Assign a unique ID for my cursor */
+	ss->cursor_number = GetCursorNumber(ss->conn);
+	ss->cursor_exists = false;
+
+	/* Get private info created by planner functions. */
+	ss->query = strVal(list_nth(plan->fdw_private,
+									 FdwScanPrivateSelectSql));
+	ss->retrieved_attrs = (List *) list_nth(plan->fdw_private,
+												 FdwScanPrivateRetrievedAttrs);
+	ss->fetch_size = intVal(list_nth(plan->fdw_private,
+										  FdwScanPrivateFetchSize));
+
+	/* Create contexts for batches of tuples and per-tuple temp workspace. */
+	ss->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											   "postgres_fdw tuple data",
+											   ALLOCSET_DEFAULT_SIZES);
+	ss->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "postgres_fdw temporary data",
+											  ALLOCSET_SMALL_SIZES);
+
+	/*
+	 * Get info we'll need for converting data fetched from the foreign server
+	 * into local representation and error reporting during that process.
+	 */
+	if (plan->scan.scanrelid > 0)
+	{
+		ss->rel = node->ss.ss_currentRelation;
+		ss->tupdesc = RelationGetDescr(ss->rel);
+	}
+	else
+	{
+		ss->rel = NULL;
+		ss->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	}
+
+	ss->attinmeta = TupleDescGetAttInMetadata(ss->tupdesc);
+
+	/*
+	 * Prepare for processing of parameters used in remote query, if any.
+	 */
+	numParams = list_length(plan->fdw_exprs);
+	ss->numParams = numParams;
+	if (numParams > 0)
+		prepare_query_params((PlanState *) node,
+							 plan->fdw_exprs,
+							 numParams,
+							 &ss->param_flinfo,
+							 &ss->param_exprs,
+							 &ss->param_values);
 }
 
 static void
