@@ -7,5 +7,5 @@ default_version = '0.0.1'
 # * Prepend schema name to all shardman funcs calls from C code
 relocatable = false
 schema = mypg
-# requires = 'pg_pathman, postgres_fdw'
+# requires = 'postgres_fdw'
 requires = 'postgres_fdw'

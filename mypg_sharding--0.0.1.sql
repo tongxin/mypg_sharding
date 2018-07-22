@@ -29,17 +29,19 @@ $$;
 -- Node state
 CREATE TABLE nodestate (
 	node_name char(64) NOT NULL,   -- the node name
-	current char(16) NOT NULL,         -- local node state: INIT, ACTIVE, or INACTIVE
-	epoch integer NOT NULL         -- starting from 1, increased everytime a cluster configuration change occurs 
+	current char(16) NOT NULL,     -- local node state: INIT, ACTIVE, or INACTIVE
+	epoch integer NOT NULL,        -- starting from 1, incremented everytime the state changes
+	hashstate char(32) NOT NULL	   -- hash value of the cluster state
 );
 
--- Server nodes
-CREATE TABLE cluster_nodes (
+-- Cluster nodes
+CREATE TABLE nodes (
 	node_name char(64) NOT NULL UNIQUE,
 	system_id bigint NOT NULL UNIQUE,
 	host char(64) NOT NULL,
 	port char(8) NOT NULL,
 	dbname char(64) NOT NULL,
+	coninfo text NOT NULL,
 	UNIQUE (host, port)
 );
 
@@ -56,7 +58,7 @@ CREATE TABLE tables (
 );
 
 CREATE TABLE partitions (
-	localid Oid,                   -- Local oid of the partition table
+	partid regclass,               -- Local oid of the partition table
 	relname char(64),              -- table name
 	p int,                         -- partition index
 	node text                      -- the node at which the partition is allocated
@@ -71,7 +73,7 @@ create type exec_result as (res text, msg text);
 
 -- Sharding interface functions
 
-CREATE FUNCTION add_node (name_ text, host_ text, port_ text) 
+CREATE FUNCTION add_node (name_ text, coninfo text)
 RETURNS table(res text, msg text) AS $$
 DECLARE
 	node mypg.cluster_nodes;
@@ -92,21 +94,15 @@ BEGIN
 		RAISE EXCEPTION 'Only master node can invoke add_node.';
 	END IF;
 
-	-- Error if the node is already added.
+	-- Error if the node already exists.
 	IF EXISTS (
 		SELECT 1 
 		FROM mypg.cluster_nodes
-		WHERE node_name = name_)
+		WHERE node_name = name_ OR
+			(host_ = host AND port_ = port)
+		)
 	THEN
-		RAISE EXCEPTION 'Node % already exists.', name_;
-	END IF;
-	
-	IF EXISTS (
-		SELECT 1 
-		FROM mypg.cluster_nodes
-		WHERE host_ = host and port_ = port)
-	THEN
-		RAISE EXCEPTION 'Node exists with host=% and port=%', host_, port_;
+		RAISE EXCEPTION 'Node already exists.';
 	END IF;
 
 	SELECT current_database() INTO currentdb;
@@ -207,6 +203,22 @@ BEGIN
 	WHERE node_name = name_;	
 END
 $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION _clone_state_to(coninfo text, tables text[])
+RETURNS bool AS $$
+DECLARE
+
+BEGIN
+
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION _update_state_add_node(last_epoch int, node_name char(64), coninfo text)
+RETURNS int AS $$
+DECLARE
+
+BEGIN
+
+END $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION pick_localpart_relid(arg_relname text)
 RETURNS oid AS $$
