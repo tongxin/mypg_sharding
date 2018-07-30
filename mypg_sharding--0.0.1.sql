@@ -24,183 +24,174 @@ BEGIN
 END
 $$;
 
--- Metadata tables
+-- This extension defines core data and functions for sharding controllers.
 
--- Node state
-CREATE TABLE nodestate (
-	node_name char(64) NOT NULL,   -- the node name
-	current char(16) NOT NULL,     -- local node state: INIT, ACTIVE, or INACTIVE
-	epoch integer NOT NULL,        -- starting from 1, incremented everytime the state changes
-	hashstate char(32) NOT NULL	   -- hash value of the cluster state
+-- The global sharding state is maintained in the following defined tables.
+
+-- The list of cluster nodes for sharding to take place on
+CREATE TABLE nodeinfo (
+	node_name	text	PRIMARY KEY,
+	system_id	bigint	NOT NULL	UNIQUE,
+	coninfo		text	NOT NULL,		   -- may require superuser role
 );
 
--- Cluster nodes
-CREATE TABLE nodes (
-	node_name char(64) NOT NULL UNIQUE,
-	system_id bigint NOT NULL UNIQUE,
-	host char(64) NOT NULL,
-	port char(8) NOT NULL,
-	dbname char(64) NOT NULL,
-	coninfo text NOT NULL,
-	UNIQUE (host, port)
+-- The list of distributed tables
+CREATE TABLE tableinfo (
+	table_name	text	PRIMARY KEY,  -- sharding table's global name
+	create_sql	text       			-- sql to create the table
+--	create_rules_sql text          	-- sql to create rules for shared table
 );
 
--- Distributed tables
-CREATE TABLE tables (
-	relname char(64) PRIMARY KEY,   -- table name
-	distkey smallint,               -- attribute number of the sharding key column
-	modulo smallint,                -- maximum number of distributed partitions
-	rows_est real,
-	width_est smallint,
-	tuples  real,
-	create_sql text NOT NULL       -- sql to create the table
---	create_rules_sql text          -- sql to create rules for shared table
+-- This maintains a list of table sharding information, i.e., basically,
+-- the hash key column and the total count of shards for each table. 
+CREATE TABLE shardinginfo (
+	table_name 	text	PRIMARY KEY	REFERENCES tableinfo(table_name),
+	shard_key 	text,			   -- hash key column
+	shard_count	smallint	       -- total count of hash partititons
 );
 
-CREATE TABLE partitions (
-	partid regclass,               -- Local oid of the partition table
-	relname char(64),              -- table name
-	p int,                         -- partition index
-	node text                      -- the node at which the partition is allocated
+CREATE TABLE partitioninfo (
+	table_name	text	REFERENCES shardinginfo(table_name),
+	relname		text,              -- Local table name for this partition
+	shard_slot	smallint,		   -- index of the shard
+	node_name	text	REFERENCES nodeinfo(node_name)  -- the host node of the partition
 );
 
 -- Make the above config tables dump-able
-SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
-SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
-SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
-
-create type exec_result as (res text, msg text);
+-- SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
+-- SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
+-- SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
 -- Sharding interface functions
 
-CREATE FUNCTION add_node (name_ text, coninfo text)
-RETURNS table(res text, msg text) AS $$
+-- Add new node to the sharding cluster. Some constraints include: ...
+CREATE FUNCTION add_node (
+	newnode_name 	text,
+	newnode_coninfo text
+)
+RETURNS record AS $$
 DECLARE
-	node mypg.cluster_nodes;
-	sys_id bigint;
-	currentdb text;
-	current_epoch int;
-	copy_nodes_msg text := '';
-	init_nodestate_msg text := '';
-	insert_node_msg text := '';
-	copy_tables_msg text := '';
-	update_epoch_msg text := '';
-	res_res text;
-	res_msg text;
+	nodename		text;
+	tablename		text;
+	createsql		text;
+	shardkey		text;
+	partname		text;
+	shardcount		smallint;
+	sys_id			bigint;
+	coninfo			text;
+	server_opts		text;
+	um_opts			text;
+	new_server_opts text;
+	new_um_opts		text;
+	fdws			text = '';
+	usms			text = '';
+	create_tables	text = '';
+	create_partitions text = '';
+	create_fdws		text = '';
+	table_attrs		text;
+	res_res			text;
+	res_msg			text;
 BEGIN
-	-- Fail if this command is not run at the master node.
-	IF NOT mypg.is_master()
-	THEN 
-		RAISE EXCEPTION 'Only master node can invoke add_node.';
-	END IF;
-
 	-- Error if the node already exists.
 	IF EXISTS (
-		SELECT 1 
-		FROM mypg.cluster_nodes
-		WHERE node_name = name_ OR
-			(host_ = host AND port_ = port)
-		)
+		SELECT 	1 
+		FROM 	mypg.nodeinfo
+		WHERE 	node_name = newnode_name
+	)
 	THEN
-		RAISE EXCEPTION 'Node already exists.';
+		RAISE EXCEPTION 'Node % already exists.', newnode_name;
 	END IF;
 
-	SELECT current_database() INTO currentdb;
+	-- Insert new node in the nodeinfo table.
+	INSERT INTO	mypg.cluster_nodes
+			(node_name,		system_id, 	coninfo)
+	VALUES 	(newnode_name, 	0, 			newnode_coninfo);
 
-	-- Insert new node in the cluster_nodes table. Update master's epoch number.
-	INSERT INTO mypg.cluster_nodes (node_name, system_id, host, port, dbname)
-	VALUES (name_, 0, host_, port_, currentdb); 
-
-	-- Check if the new node is in INIT state
-	SELECT * INTO res_res, res_msg 
-	FROM mypg.broadcast(format('%s:SELECT current FROM mypg.nodestate WHERE node_name = ''%s'';',
-								name_, name_));
-	IF res_res IS NULL OR res_res <> 'INIT'
+	-- Validate the accessibility of the new node.
+	IF NOT EXISTS (
+		SELECT * FROM mypg.remote_exec('SELECT 1;', newnode_coninfo);
+	)
 	THEN
-		RAISE EXCEPTION 'Node % is not in INIT state and cannot be added: %',
-						name_, res_res;
+		RAISE EXCEPTION 'Connection failed with connection string ''%''.', newnode_coninfo;
 	END IF;
 
 	-- Retrieve the system id from the new node.
- 	SELECT * INTO res_res, res_msg
-	FROM mypg.broadcast(format('%s:SELECT mypg.get_system_id();', name_));
-	IF res_msg IS NOT NULL
+ 	sys_id := mypg.remote_exec('SELECT mypg.get_system_id();', newnode_coninfo);
+	IF EXISTS (SELECT 1 FROM mypg.nodeinfo WHERE system_id = sys_id)
 	THEN
-		RAISE EXCEPTION 'Remote error in mypg.get_system_id(): %', res_msg;
+		RAISE EXCEPTION 'Node with system id % already is in the cluster.' sys_id;
 	END IF;
-	sys_id := res_res;
-	IF EXISTS (SELECT 1 FROM mypg.cluster_nodes WHERE system_id = sys_id)
-	THEN
-		RAISE EXCEPTION 'System id has been taken.';
-	END IF;
+
 	-- Update the node's system_id in the cluster_nodes table.
-	UPDATE mypg.cluster_nodes
-	SET system_id = sys_id
-	WHERE node_name = name_;
+	UPDATE	mypg.nodeinfo
+	SET 	system_id = sys_id
+	WHERE	node_name = newnode_name;
 
- 	-- Copy the cluster metadata off to the new node.
-	SELECT * INTO res_res, res_msg
-	FROM mypg.copy_table_data('mypg.cluster_nodes', name_);
-	IF res_msg IS NOT NULL
-	THEN
-		RAISE EXCEPTION 'Failed to copy mypg.cluster_nodes to %: %', name_, res_msg;
-	ELSE
-		RAISE INFO 'Successful copy of mypg.cluster_nodes to %', name_;
-	END IF;
-
-	SELECT epoch INTO current_epoch
-	FROM mypg.nodestate
-	LIMIT 1;
-
-	init_nodestate_msg :=
-		format('%s:UPDATE mypg.nodestate SET current = ''ACTIVE'', epoch = %s WHERE node_name = ''%s'';',
-				name_, current_epoch, name_);
-
-	SELECT * INTO res_res, res_msg
-	FROM mypg.broadcast(init_nodestate_msg, iso_level => 'READ COMMITTED'); -- needs error handling here
+	-- Add foreign servers for connection between the new and existing nodes.
+	SELECT 	*
+	FROM	mypg.conninfo_to_postgres_fdw_opts(conn_string_effective)
+	INTO	new_server_opts,
+			new_um_opts;
 	
-	IF res_msg IS NOT NULL
-	THEN
-		RAISE EXCEPTION 'Failed to update mypg.nodestate on node %: %', name_, res_msg;
-	ELSE
-		RAISE INFO 'nodestate on % is updated; epoch = %', name_, current_epoch;
-	END IF;
-
-	-- Copy the tables metadata to the new node.
-	IF EXISTS (
-		SELECT 1 FROM mypg.tables) 
-	THEN
-		copy_tables_msg :=
-			format('%s:%s', name_, mypg.gen_copy_table_sql('mypg.tables'));
-		PERFORM mypg.broadcast(copy_tables_msg);
-	END IF;
-
-	UPDATE mypg.nodestate
-	SET epoch = epoch + 1
-		RETURNING epoch INTO current_epoch;
-	
-	-- Update on all cluster nodes to include the new node. 
-	FOR node IN 
-	SELECT * FROM mypg.cluster_nodes
+	FOR 	nodename, coninfo, server_opts, um_opts IN
+	SELECT 	node_name,
+			coninfo,
+			(mypg.conninfo_to_postgres_fdw_opts(coninfo)).*
+	FROM 	mypg.nodeinfo
+	WHERE 	node_name <> newnode_name
 	LOOP
-		insert_node_msg :=
-			format('%s%s:INSERT INTO mypg.cluster_nodes VALUES (''%s'', %s, ''%s'', ''%s'', ''%s'');', 
-		            insert_node_msg, node.node_name, name_, sys_id, host_, port_, currentdb);
-		update_epoch_msg :=
-			format('%s%s:UPDATE mypg.nodestate SET epoch = epoch + 1 WHERE node_name = ''%s'' RETURNING epoch;',
-		 			update_epoch_msg, node.node_name, node.node_name);
-	END LOOP;
-	
-	SELECT * INTO res_res, res_msg
-	FROM mypg.broadcast(insert_node_msg);
+		-- Create foreign server for new node at all other nodes and servers at new node for all other nodes
+		fdws := format('%s%s:CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw %s;
+			 			  %s:CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw %s;',
+			 fdws, newnode_name, nodename, server_opts,
+			 	   nodename, newnode_name, new_server_opts);
 
-	SELECT * INTO res_res, res_msg
-	FROM mypg.broadcast(update_epoch_msg, two_phase => true, iso_level => 'READ COMMITTED');
- 
-	RETURN QUERY
-	SELECT 'SUCCESS', format('%I, %I, %I, %I, %I', node_name, system_id, host, port, dbname)
-	FROM mypg.cluster_nodes
-	WHERE node_name = name_;	
+		-- Create user mapping for this servers
+		usms := format('%s%s:CREATE USER MAPPING FOR CURRENT_USER SERVER %s %s;
+			 			  %s:CREATE USER MAPPING FOR CURRENT_USER SERVER %s %s;',
+			 usms, newnode_name, node.node_name, um_opts,
+			      node.node_name, newnode_name, new_um_opts);
+	END LOOP;
+	-- Broadcast command for creating foreign servers
+	PERFORM shardman.broadcast(fdws);
+	-- Broadcast command for creating user mapping for this servers
+	PERFORM shardman.broadcast(usms);
+
+	-- On the new node, create FDWs for all existing distributed tables.
+	FOR		tablename, createsql, shardkey, shardcount IN 
+	SELECT	t.table_name,
+			t.create_sql,
+			s.shard_key,
+			s.shard_count
+	FROM 	mypg.tableinfo		t
+	JOIN 	mypg.shardinginfo	s	ON	t.table_name = s.table_name
+	LOOP
+		create_tables := format('%s{%s:%s}',
+			create_tables, newnode_name, createsql);
+		create_partitions := format('%s%s:SELECT create_hash_partitions(%L,%L,%L);',
+			create_partitions, newnode_name, tablename, shardkey, shardcount);
+		SELECT mypg.reconstruct_table_attrs(tablename) INTO table_attrs;
+
+		FOR		nodename, partname IN
+		SELECT 	node_name,
+				relname,
+		FROM	mypg.partitioninfo 
+		WHERE	table_name = tablename
+	    LOOP
+			create_fdws := format(
+				'%s%s:SELECT shardman.replace_real_with_foreign(%s, %L, %L);',
+				create_fdws, newnode_name, nodename, partname, table_attrs);
+		END LOOP;
+	END LOOP;
+
+	-- Broadcast create table commands
+	PERFORM mypg.broadcast(create_tables);
+	-- Broadcast create hash partitions command
+	PERFORM mypg.broadcast(create_partitions, iso_level => 'read committed');
+	-- Broadcast create foreign table commands
+	PERFORM mypg.broadcast(create_fdws);
+
+	RETURN newnode_name;
 END
 $$ LANGUAGE plpgsql;
 
@@ -231,6 +222,55 @@ BEGIN
 	LIMIT 1
 END
 $$ LANGUAGE plpgsql;
+
+-- Construct postgres_fdw options based on the given connection string
+CREATE FUNCTION conninfo_to_postgres_fdw_opts(IN conn_string text,
+	OUT server_opts text, OUT um_opts text) RETURNS record AS $$
+DECLARE
+	conn_string_keywords text[];
+	conn_string_vals text[];
+	server_opts_first_time_through bool = true;
+	um_opts_first_time_through bool = true;
+BEGIN
+	server_opts := '';
+	um_opts := '';
+	SELECT * FROM mypg.pq_conninfo_parse(conn_string)
+	  INTO conn_string_keywords, conn_string_vals;
+	FOR i IN 1..array_upper(conn_string_keywords, 1) LOOP
+		IF conn_string_keywords[i] = 'client_encoding' OR
+			conn_string_keywords[i] = 'fallback_application_name' THEN
+			CONTINUE; /* not allowed in postgres_fdw */
+		ELSIF conn_string_keywords[i] = 'user' OR
+			conn_string_keywords[i] = 'password' THEN -- user mapping option
+			IF NOT um_opts_first_time_through THEN
+				um_opts := um_opts || ', ';
+			END IF;
+			um_opts_first_time_through := false;
+			um_opts := um_opts ||
+				format('%s %L', conn_string_keywords[i], conn_string_vals[i]);
+		ELSE -- server option
+			IF NOT server_opts_first_time_through THEN
+				server_opts := server_opts || ', ';
+			END IF;
+			server_opts_first_time_through := false;
+			server_opts := server_opts ||
+				format('%s %L', conn_string_keywords[i], conn_string_vals[i]);
+		END IF;
+	END LOOP;
+
+	-- OPTIONS () is syntax error, so add OPTIONS only if we really have opts
+	IF server_opts != '' THEN
+		server_opts := format(' OPTIONS (%s)', server_opts);
+	END IF;
+	IF um_opts != '' THEN
+		um_opts := format(' OPTIONS (%s)', um_opts);
+	END IF;
+END $$ LANGUAGE plpgsql STRICT;
+
+-- Parse connection string. This function is used by
+-- conninfo_to_postgres_fdw_opts to construct postgres_fdw options list.
+CREATE FUNCTION pq_conninfo_parse(IN conninfo text, OUT keys text[], OUT vals text[])
+	RETURNS record AS 'mypg_sharding' LANGUAGE C STRICT;
 
 -- Generate based on information from catalog SQL statement creating this table
 CREATE FUNCTION gen_create_table_sql(relation text)
@@ -298,20 +338,3 @@ CREATE FUNCTION get_system_id()
 
 -- Initialization 
 
--- Initialize nodestate for master
-DO $$
-DECLARE
-is_master bool;
-init_state text;
-name_ text;
-BEGIN
-	is_master := mypg.is_master();
-	if is_master THEN
-		init_state := 'ACTIVE';
-	ELSE
-		init_state := 'INIT';
-	END IF;
-	name_ := mypg.node_name();
-	INSERT INTO mypg.nodestate(node_name,current,epoch)
-	VALUES (name_, init_state, 0);
-END$$;
