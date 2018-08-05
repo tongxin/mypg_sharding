@@ -35,26 +35,40 @@ CREATE TABLE nodeinfo (
 	coninfo		text	NOT NULL,		   -- may require superuser role
 );
 
--- The list of distributed tables
+-- Each shard/node is organized in chunks each of which contains one partition
+-- from each of a set of related tables which can be called a table family.
+-- Tables from the same table family are sharded in the same way, meaning
+-- their partitions reside side by side in the same set of chunks.
+
+CREATE TABLE alltablespaces (
+	ts_no		serial	PRIMARY KEY,
+	node_name	text	REFERENCES nodeinfo,
+	ts			text				-- local tablespace name
+	UNIQUE (node_name, ts)
+);
+
+CREATE TABLE dtsinfo (
+	dts			text,				-- which dts this tablespace belongs to
+	dts_idx		int,				-- all tablespaces within a dts form an indexed array
+	ts_no		REFERENCES alltablespaces (ts_no),
+	UNIQUE (dts, idx),
+	UNIQUE (ts_no)
+);
+
+-- List of all distributed tables.
 CREATE TABLE tableinfo (
 	table_name	text	PRIMARY KEY,  -- sharding table's global name
+	sharding_key		text,		-- partition key expression
+	dts			text,				-- distributed tablespace set to reside in
 	create_sql	text       			-- sql to create the table
 --	create_rules_sql text          	-- sql to create rules for shared table
 );
 
--- This maintains a list of table sharding information, i.e., basically,
--- the hash key column and the total count of shards for each table. 
-CREATE TABLE shardinginfo (
-	table_name 	text	PRIMARY KEY	REFERENCES tableinfo(table_name),
-	shard_key 	text,			   -- hash key column
-	shard_count	smallint	       -- total count of hash partititons
-);
-
 CREATE TABLE partitioninfo (
-	table_name	text	REFERENCES shardinginfo(table_name),
-	relname		text,              -- Local table name for this partition
-	shard_slot	smallint,		   -- index of the shard
-	node_name	text	REFERENCES nodeinfo(node_name)  -- the host node of the partition
+	table_name	text	REFERENCES tableinfo,
+	relname		text,              	-- Local table name for this partition
+	ts_no		int		REFERENCES alltablespaces,
+	UNIQUE (table_name, ts_no)
 );
 
 -- Make the above config tables dump-able
@@ -103,7 +117,7 @@ BEGIN
 	END IF;
 
 	-- Insert new node in the nodeinfo table.
-	INSERT INTO	mypg.cluster_nodes
+	INSERT INTO	mypg.nodeinfo
 			(node_name,		system_id, 	coninfo)
 	VALUES 	(newnode_name, 	0, 			newnode_coninfo);
 
@@ -179,7 +193,7 @@ BEGIN
 		WHERE	table_name = tablename
 	    LOOP
 			create_fdws := format(
-				'%s%s:SELECT shardman.replace_real_with_foreign(%s, %L, %L);',
+				'%s%s:SELECT mypg.replace_real_with_foreign(%s, %L, %L);',
 				create_fdws, newnode_name, nodename, partname, table_attrs);
 		END LOOP;
 	END LOOP;
@@ -195,33 +209,23 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION _clone_state_to(coninfo text, tables text[])
-RETURNS bool AS $$
+-- Replace real partition with foreign one. Real partition is locked to avoid
+-- stale writes.
+CREATE FUNCTION replace_real_with_foreign(target_srv int, part_name name, table_attrs text)
+	RETURNS void AS $$
 DECLARE
-
+	srv_name name :=  format('node_%s', target_srv);
+	fdw_part_name name := format('%s_fdw', part_name);
 BEGIN
-
-END $$ LANGUAGE plpgsql;
-
-CREATE FUNCTION _update_state_add_node(last_epoch int, node_name char(64), coninfo text)
-RETURNS int AS $$
-DECLARE
-
-BEGIN
-
-END $$ LANGUAGE plpgsql;
-
-CREATE FUNCTION pick_localpart_relid(arg_relname text)
-RETURNS oid AS $$
-DECLARE
-BEGIN
-	RETURN QUERY
-	SELECT oid
-	FROM mypg.partitions
-	WHERE relanme = arg_relname
-	LIMIT 1
+	RAISE DEBUG '[SHMN] replace table % with foreign %', part_name, fdw_part_name;
+	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+				   fdw_part_name, table_attrs, srv_name, part_name);
+	PERFORM replace_hash_partition(part_name::regclass, fdw_part_name::regclass);
+	EXECUTE format('TRUNCATE TABLE %I', part_name);
+	PERFORM shardman.write_protection_on(part_name::regclass);
 END
 $$ LANGUAGE plpgsql;
+
 
 -- Construct postgres_fdw options based on the given connection string
 CREATE FUNCTION conninfo_to_postgres_fdw_opts(IN conn_string text,
