@@ -47,6 +47,7 @@ CREATE TABLE alltablespaces (
 	UNIQUE (node_name, ts)
 );
 
+-- All distributed tablespaces
 CREATE TABLE dtsinfo (
 	dts			text,				-- which dts this tablespace belongs to
 	dts_idx		int,				-- all tablespaces within a dts form an indexed array
@@ -229,6 +230,101 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE FUNCTION create_distributed_tablespace(dts text, nodes text[])
+
+CREATE FUNCTION create_tablespace(node text, dts text)
+
+
+-- Shard table across all the available nodes
+CREATE FUNCTION create_hash_partitions(rel_name name, expr text)
+RETURNS void AS $$
+DECLARE
+	create_table text;
+	node shardman.nodes;
+	node_ids int[];
+	node_id int;
+	part_name text;
+	fdw_part_name text;
+	table_attrs text;
+	srv_name text;
+	create_tables text = '';
+	create_partitions text = '';
+	create_fdws text = '';
+	replace_parts text = '';
+	i int;
+	n_nodes int;
+BEGIN
+	IF EXISTS(SELECT relation FROM shardman.tables WHERE relation = rel_name)
+	THEN
+		RAISE EXCEPTION 'Table % is already sharded', rel_name;
+	END IF;
+
+	IF (SELECT count(*) FROM shardman.nodes) = 0 THEN
+		RAISE EXCEPTION 'Please add some nodes first';
+	END IF;
+
+	-- Check right away to avoid unneccessary recover()
+	PERFORM shardman.check_max_replicas(redundancy);
+
+	-- Generate SQL statement creating this table
+	SELECT shardman.gen_create_table_sql(rel_name) INTO create_table;
+
+	INSERT INTO shardman.tables (relation,sharding_key,partitions_count,create_sql) values (rel_name,expr,part_count,create_table);
+
+	-- Create parent table and partitions at all nodes
+	FOR node IN SELECT * FROM shardman.nodes
+	LOOP
+		-- Create parent table at all nodes
+		create_tables := format('%s{%s:%s}',
+			create_tables, node.id, create_table);
+		create_partitions := format('%s%s:select create_hash_partitions(%L,%L,%L);',
+			create_partitions, node.id, rel_name, expr, part_count);
+	END LOOP;
+
+	-- Broadcast create table commands
+	PERFORM shardman.broadcast(create_tables);
+	-- Broadcast create hash partitions command
+	PERFORM shardman.broadcast(create_partitions, iso_level => 'read committed');
+
+	-- Get list of nodes in random order
+	SELECT ARRAY(SELECT id from shardman.nodes ORDER BY random()) INTO node_ids;
+	n_nodes := array_length(node_ids, 1);
+
+	-- Reconstruct table attributes from parent table
+	SELECT shardman.reconstruct_table_attrs(rel_name::regclass) INTO table_attrs;
+
+	FOR i IN 0..part_count-1
+	LOOP
+		-- Choose location of new partition
+		node_id := node_ids[1 + (i % n_nodes)]; -- round robin
+		part_name := format('%s_%s', rel_name, i);
+		fdw_part_name := format('%s_fdw', part_name);
+		-- Insert information about new partition in partitions table
+		INSERT INTO shardman.partitions (part_name, node_id, relation) VALUES (part_name, node_id, rel_name);
+		-- Construct name of the server where partition will be located
+		srv_name := format('node_%s', node_id);
+
+		-- Replace local partition with foreign table at all nodes except owner
+		FOR node IN SELECT * FROM shardman.nodes WHERE id<>node_id
+		LOOP
+			-- Create foreign table for this partition
+			create_fdws := format(
+				'%s%s:SELECT shardman.replace_real_with_foreign(%s, %L, %L);',
+				create_fdws, node.id, node_id, part_name, table_attrs);
+		END LOOP;
+	END LOOP;
+
+	-- Broadcast create foreign table commands
+	PERFORM shardman.broadcast(create_fdws, iso_level => 'read committed');
+	-- Broadcast replace hash partition commands
+	PERFORM shardman.broadcast(replace_parts);
+
+	IF redundancy <> 0
+	THEN
+		PERFORM shardman.set_redundancy(rel_name, redundancy, copy_data => false);
+	END IF;
+END
+$$ LANGUAGE plpgsql;
 
 -- Construct postgres_fdw options based on the given connection string
 CREATE FUNCTION conninfo_to_postgres_fdw_opts(IN conn_string text,
