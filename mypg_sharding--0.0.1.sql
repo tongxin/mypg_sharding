@@ -71,6 +71,15 @@ CREATE TABLE partitioninfo (
 	UNIQUE (table_name, ts_no)
 );
 
+-- List all local partitions on each node
+CREATE VIEW table_partition_view AS
+SELECT	p.table_name,
+		p.relname,
+		s.node_name
+FROM	partitioninfo	p
+JOIN	alltablespaces	s	ON	s.ts_no = p.ts_no;
+
+
 -- Make the above config tables dump-able
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.tables', '');
@@ -90,6 +99,7 @@ DECLARE
 	createsql		text;
 	shardkey		text;
 	partname		text;
+	fdw_partname	text;
 	shardcount		smallint;
 	sys_id			bigint;
 	coninfo			text;
@@ -175,10 +185,16 @@ BEGIN
 	FOR		tablename, createsql, shardkey, shardcount IN 
 	SELECT	t.table_name,
 			t.create_sql,
-			s.shard_key,
-			s.shard_count
+			t.sharding_key,
+			p.partition_count
 	FROM 	mypg.tableinfo		t
-	JOIN 	mypg.shardinginfo	s	ON	t.table_name = s.table_name
+	JOIN	(
+			SELECT 	table_name, 
+					count(*)	partition_count
+			FROM	mypg.partitioninfo
+			GROUP BY table_name
+			) p	
+	ON	t.table_name = p.table_name
 	LOOP
 		create_tables := format('%s{%s:%s}',
 			create_tables, newnode_name, createsql);
@@ -187,14 +203,18 @@ BEGIN
 		SELECT mypg.reconstruct_table_attrs(tablename) INTO table_attrs;
 
 		FOR		nodename, partname IN
-		SELECT 	node_name,
-				relname,
-		FROM	mypg.partitioninfo 
+		FROM	mypg.table_partition_view 
 		WHERE	table_name = tablename
 	    LOOP
+			fdw_partname := format('%s_fdw', partname);
 			create_fdws := format(
-				'%s%s:SELECT mypg.replace_real_with_foreign(%s, %L, %L);',
-				create_fdws, newnode_name, nodename, partname, table_attrs);
+				'%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
+				create_fdws, newnode_name, fdw_partname, table_attrs, nodename, partname);
+			create_fdws := format(
+				'%s%s:SELECT replace_hash_partition(%I::regclass, %I::regclass);',
+				partname, fdw_partname);
+			create_fdws := format(
+				'%s%s:TRUNCATE TABLE %I;', partname);
 		END LOOP;
 	END LOOP;
 
@@ -202,27 +222,10 @@ BEGIN
 	PERFORM mypg.broadcast(create_tables);
 	-- Broadcast create hash partitions command
 	PERFORM mypg.broadcast(create_partitions, iso_level => 'read committed');
-	-- Broadcast create foreign table commands
+	-- Create foreign tables for all foreign partitions on the new node
 	PERFORM mypg.broadcast(create_fdws);
 
 	RETURN newnode_name;
-END
-$$ LANGUAGE plpgsql;
-
--- Replace real partition with foreign one. Real partition is locked to avoid
--- stale writes.
-CREATE FUNCTION replace_real_with_foreign(target_srv int, part_name name, table_attrs text)
-	RETURNS void AS $$
-DECLARE
-	srv_name name :=  format('node_%s', target_srv);
-	fdw_part_name name := format('%s_fdw', part_name);
-BEGIN
-	RAISE DEBUG '[SHMN] replace table % with foreign %', part_name, fdw_part_name;
-	EXECUTE format('CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
-				   fdw_part_name, table_attrs, srv_name, part_name);
-	PERFORM replace_hash_partition(part_name::regclass, fdw_part_name::regclass);
-	EXECUTE format('TRUNCATE TABLE %I', part_name);
-	PERFORM shardman.write_protection_on(part_name::regclass);
 END
 $$ LANGUAGE plpgsql;
 
