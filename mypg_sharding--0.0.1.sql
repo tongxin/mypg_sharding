@@ -200,7 +200,7 @@ BEGIN
 			create_partitions, newnode_name, tablename, shardkey, shardcount);
 		SELECT mypg.reconstruct_table_attrs(tablename) INTO table_attrs;
 
-		FOR	i IN 1..array_length(shardnodes)
+		FOR	i IN 1..array_length(shardnodes, 1)
 	    LOOP
 			nodename := shardnodes[i];
 			partname := format('%s_%s', tablename, shardidx[i]);
@@ -227,6 +227,54 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE FUNCTION rebalance_nodegroup(group int)
+RETURNS void AS $$
+DECLARE
+	nodename	text;
+	sids		int[];
+	sid_min		int;
+	sid_max		int;
+	sid_count	int;
+BEGIN
+	-- Check validity of the argument
+	IF NOT EXISTS (
+		SELECT 	1
+		FROM	nodeinfo
+		WHERE	nodegroup = group
+	)
+	THEN
+		RAISE EXCEPTION 'Invalid node group id %.', group;
+	END IF;
+
+	-- Check if it's necessary to do data rebalance.
+	IF NOT EXISTS (
+		SELECT	1
+		FROM	nodeinfo
+		WHERE	nodegroup = group
+			AND	balanced_idx IS NULL
+	)
+	THEN
+		RAISE EXCEPTION 'All nodes are balanced in this group. No more work is needed.';
+	END IF;
+
+	-- Validate the existing non-null balanced_idx's form a sequence 1..s
+	SELECT 	array_agg(balanced_idx ORDER BY balanced_idx),
+			min(balanced_idx),
+			max(balanced_idx),
+			count(*)
+	INTO	sids, sid_min, sid_max, sid_count 
+	FROM	nodeinfo
+	WHERE	nodegroup = group
+		AND	balanced_idx IS NOT NULL
+
+	IF sid_min <> 1 OR sid_max <> sid_count
+	THEN
+		RAISE EXCEPTION 'Existing sharding is broken in node group %, requiring further investigation', group;
+	END IF;
+	
+	 
+END
+$$ LANGUAGE plpgsql;
 
 -- Shard table across all the available nodes
 CREATE FUNCTION create_hash_partitions(rel_name name, expr text)
