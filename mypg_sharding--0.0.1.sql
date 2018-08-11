@@ -28,58 +28,31 @@ $$;
 
 -- The global sharding state is maintained in the following defined tables.
 
+-- Node groups
+CREATE TABLE nodegroup (
+	groupid		smallint	PRIMARY KEY,
+	info		text						-- short description
+);
+
 -- The list of cluster nodes for sharding to take place on
 CREATE TABLE nodeinfo (
 	node_name	text	PRIMARY KEY,
 	system_id	bigint	NOT NULL	UNIQUE,
-	coninfo		text	NOT NULL,		   -- may require superuser role
-);
-
--- Each shard/node is organized in chunks each of which contains one partition
--- from each of a set of related tables which can be called a table family.
--- Tables from the same table family are sharded in the same way, meaning
--- their partitions reside side by side in the same set of chunks.
-
-CREATE TABLE alltablespaces (
-	ts_no		serial	PRIMARY KEY,
-	node_name	text	REFERENCES nodeinfo,
-	ts			text				-- local tablespace name
-	UNIQUE (node_name, ts)
-);
-
--- All distributed tablespaces
-CREATE TABLE dtsinfo (
-	dts			text,				-- which dts this tablespace belongs to
-	dts_idx		int,				-- all tablespaces within a dts form an indexed array
-	ts_no		REFERENCES alltablespaces (ts_no),
-	UNIQUE (dts, idx),
-	UNIQUE (ts_no)
+	coninfo		text	NOT NULL,		   	-- may require superuser role
+	node_group	smallint	REFERENCES nodegroup,
+											-- assign a group to this node
+	balanced_idx	int						-- NULL means data balance work is not done yet on this node
+											-- otherwise a unique balanced index in the node group
 );
 
 -- List of all distributed tables.
 CREATE TABLE tableinfo (
-	table_name	text	PRIMARY KEY,  -- sharding table's global name
-	sharding_key		text,		-- partition key expression
-	dts			text,				-- distributed tablespace set to reside in
-	create_sql	text       			-- sql to create the table
---	create_rules_sql text          	-- sql to create rules for shared table
+	table_name	text	PRIMARY KEY,  		-- sharding table's global name
+	sharding_key		text,				-- partition key expression
+	node_group			smallint,			-- assigned node group
+	create_sql			text       			-- sql to create the table
+--	create_rules_sql text          			-- sql to create rules for shared table
 );
-
-CREATE TABLE partitioninfo (
-	table_name	text	REFERENCES tableinfo,
-	relname		text,              	-- Local table name for this partition
-	ts_no		int		REFERENCES alltablespaces,
-	UNIQUE (table_name, ts_no)
-);
-
--- List all local partitions on each node
-CREATE VIEW table_partition_view AS
-SELECT	p.table_name,
-		p.relname,
-		s.node_name
-FROM	partitioninfo	p
-JOIN	alltablespaces	s	ON	s.ts_no = p.ts_no;
-
 
 -- Make the above config tables dump-able
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.cluster_nodes', '');
@@ -87,11 +60,23 @@ JOIN	alltablespaces	s	ON	s.ts_no = p.ts_no;
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
 -- Sharding interface functions
+CREATE FUNCTION add_nodegroup (
+	IN	descr			text,
+	OUT	gid				smallint
+)
+RETURNS smallint AS $$
+BEGIN
+	INSERT INTO mypg.node_group (balanced,	info)
+	VALUES 						(TRUE,		descr);
+	RETURNING 	groupid	INTO	gid;
+END 
+$$ LANGUAGE plpgsql;
 
 -- Add new node to the sharding cluster. Some constraints include: ...
 CREATE FUNCTION add_node (
 	newnode_name 	text,
-	newnode_coninfo text
+	newnode_coninfo text,
+	newnode_group	smallint
 )
 RETURNS record AS $$
 DECLARE
@@ -101,7 +86,9 @@ DECLARE
 	shardkey		text;
 	partname		text;
 	fdw_partname	text;
-	shardcount		smallint;
+	shardcount		int;
+	shardidx		int[];
+	shardnodes		text[];
 	sys_id			bigint;
 	coninfo			text;
 	server_opts		text;
@@ -127,21 +114,31 @@ BEGIN
 		RAISE EXCEPTION 'Node % already exists.', newnode_name;
 	END IF;
 
+	-- Verify the required node group is valid.
+	IF NOT EXISTS (
+		SELECT	1
+		FROM	mypg.nodegroup
+		WHERE	groupid = newnode_group
+	)
+	THEN
+		RAISE EXCEPTION 'Node group % does not exist.', newnode_group;
+	END IF;
+
 	-- Insert new node in the nodeinfo table.
 	INSERT INTO	mypg.nodeinfo
-			(node_name,		system_id, 	coninfo)
-	VALUES 	(newnode_name, 	0, 			newnode_coninfo);
+			(node_name,		system_id, 	coninfo,			node_group		)
+	VALUES 	(newnode_name, 	0, 			newnode_coninfo,	newnode_group	);
 
 	-- Validate the accessibility of the new node.
 	IF NOT EXISTS (
-		SELECT * FROM mypg.remote_exec('SELECT 1;', newnode_coninfo);
+		SELECT * FROM mypg.exec_remote_query('SELECT 1;', newnode_coninfo);
 	)
 	THEN
 		RAISE EXCEPTION 'Connection failed with connection string ''%''.', newnode_coninfo;
 	END IF;
 
 	-- Retrieve the system id from the new node.
- 	sys_id := mypg.remote_exec('SELECT mypg.get_system_id();', newnode_coninfo);
+ 	sys_id := mypg.exec_remote_query('SELECT mypg.get_system_id();', newnode_coninfo);
 	IF EXISTS (SELECT 1 FROM mypg.nodeinfo WHERE system_id = sys_id)
 	THEN
 		RAISE EXCEPTION 'Node with system id % already is in the cluster.' sys_id;
@@ -163,9 +160,10 @@ BEGIN
 			coninfo,
 			(mypg.conninfo_to_postgres_fdw_opts(coninfo)).*
 	FROM 	mypg.nodeinfo
-	WHERE 	node_name <> newnode_name
+	WHERE 	node_name <> newnode_name AND node_group = newnode_group
 	LOOP
-		-- Create foreign server for new node at all other nodes and servers at new node for all other nodes
+		-- Create foreign server for new node at all other nodes 
+		-- and servers at new node for all other nodes, all within the same node group
 		fdws := format('%s%s:CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw %s;
 			 			  %s:CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw %s;',
 			 fdws, newnode_name, nodename, server_opts,
@@ -183,19 +181,18 @@ BEGIN
 	PERFORM shardman.broadcast(usms);
 
 	-- On the new node, create FDWs for all existing distributed tables.
-	FOR		tablename, createsql, shardkey, shardcount IN 
+	FOR		tablename, createsql, shardkey, shardcount, shardnodes, shardidx IN 
 	SELECT	t.table_name,
-			t.create_sql,
-			t.sharding_key,
-			p.partition_count
-	FROM 	mypg.tableinfo		t
-	JOIN	(
-			SELECT 	table_name, 
-					count(*)	partition_count
-			FROM	mypg.partitioninfo
-			GROUP BY table_name
-			) p	
-	ON	t.table_name = p.table_name
+			first(t.create_sql),
+			first(t.sharding_key),
+			count(*)
+			array_agg(s.node_name)
+			array_agg(s.balanced_idx)			
+	FROM 	mypg.tableinfo	t
+	JOIN	mypg.nodeinfo	s
+	WHERE	s.balanced_idx	is not null
+	ON		t.node_group 	= s.node_group
+	GROUP BY t.table_name
 	LOOP
 		create_tables := format('%s{%s:%s}',
 			create_tables, newnode_name, createsql);
@@ -203,10 +200,10 @@ BEGIN
 			create_partitions, newnode_name, tablename, shardkey, shardcount);
 		SELECT mypg.reconstruct_table_attrs(tablename) INTO table_attrs;
 
-		FOR		nodename, partname IN
-		FROM	mypg.table_partition_view 
-		WHERE	table_name = tablename
+		FOR	i IN 1..array_length(shardnodes)
 	    LOOP
+			nodename := shardnodes[i];
+			partname := format('%s_%s', tablename, shardidx[i]);
 			fdw_partname := format('%s_fdw', partname);
 			create_fdws := format(
 				'%s%s:CREATE FOREIGN TABLE %I %s SERVER %s OPTIONS (table_name %L);',
@@ -229,10 +226,6 @@ BEGIN
 	RETURN newnode_name;
 END
 $$ LANGUAGE plpgsql;
-
-CREATE FUNCTION create_distributed_tablespace(dts text, nodes text[])
-
-CREATE FUNCTION create_tablespace(node text, dts text)
 
 
 -- Shard table across all the available nodes
