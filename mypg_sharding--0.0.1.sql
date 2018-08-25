@@ -31,6 +31,7 @@ $$;
 -- Node groups
 CREATE TABLE nodegroup (
 	groupid		smallint	PRIMARY KEY,
+	balanced	boolean
 	info		text						-- short description
 );
 
@@ -39,7 +40,7 @@ CREATE TABLE nodeinfo (
 	node_name	text	PRIMARY KEY,
 	system_id	bigint	NOT NULL	UNIQUE,
 	coninfo		text	NOT NULL,		   	-- may require superuser role
-	node_group	smallint	REFERENCES nodegroup,
+	group		smallint	REFERENCES nodegroup,
 											-- assign a group to this node
 	balanced_idx	int						-- NULL means data balance work is not done yet on this node
 											-- otherwise a unique balanced index in the node group
@@ -49,7 +50,7 @@ CREATE TABLE nodeinfo (
 CREATE TABLE tableinfo (
 	table_name	text	PRIMARY KEY,  		-- sharding table's global name
 	sharding_key		text,				-- partition key expression
-	node_group			smallint,			-- assigned node group
+	group				smallint,			-- assigned node group
 	create_sql			text       			-- sql to create the table
 --	create_rules_sql text          			-- sql to create rules for shared table
 );
@@ -60,13 +61,13 @@ CREATE TABLE tableinfo (
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
 -- Sharding interface functions
-CREATE FUNCTION add_nodegroup (
+CREATE FUNCTION new_nodegroup (
 	IN	descr			text,
 	OUT	gid				smallint
 )
 RETURNS smallint AS $$
 BEGIN
-	INSERT INTO mypg.node_group (balanced,	info)
+	INSERT INTO mypg.nodegroup	(balanced,	info)
 	VALUES 						(TRUE,		descr);
 	RETURNING 	groupid	INTO	gid;
 END 
@@ -76,7 +77,7 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION add_node (
 	newnode_name 	text,
 	newnode_coninfo text,
-	newnode_group	smallint
+	newnode_group		smallint
 )
 RETURNS record AS $$
 DECLARE
@@ -126,9 +127,15 @@ BEGIN
 
 	-- Insert new node in the nodeinfo table.
 	INSERT INTO	mypg.nodeinfo
-			(node_name,		system_id, 	coninfo,			node_group		)
+			(node_name,		system_id, 	coninfo,			group			)
 	VALUES 	(newnode_name, 	0, 			newnode_coninfo,	newnode_group	);
 
+	-- A balanced group becomes unbalanced once a new node is added to it
+	UPDATE 	mypg.nodegroup
+	SET		balanced = FALSE
+	WHERE	groupid = newnode_group
+		AND	balanced = TRUE;
+	
 	-- Validate the accessibility of the new node.
 	IF NOT EXISTS (
 		SELECT * FROM mypg.exec_remote_query('SELECT 1;', newnode_coninfo);
@@ -160,7 +167,7 @@ BEGIN
 			coninfo,
 			(mypg.conninfo_to_postgres_fdw_opts(coninfo)).*
 	FROM 	mypg.nodeinfo
-	WHERE 	node_name <> newnode_name AND node_group = newnode_group
+	WHERE 	node_name <> newnode_name AND group = newgroup
 	LOOP
 		-- Create foreign server for new node at all other nodes 
 		-- and servers at new node for all other nodes, all within the same node group
@@ -191,7 +198,7 @@ BEGIN
 	FROM 	mypg.tableinfo	t
 	JOIN	mypg.nodeinfo	s
 	WHERE	s.balanced_idx	is not null
-	ON		t.node_group 	= s.node_group
+	ON		t.group 	= s.group
 	GROUP BY t.table_name
 	LOOP
 		create_tables := format('%s{%s:%s}',
@@ -226,6 +233,7 @@ BEGIN
 	RETURN newnode_name;
 END
 $$ LANGUAGE plpgsql;
+
 
 CREATE FUNCTION rebalance_nodegroup(group int)
 RETURNS void AS $$
@@ -271,8 +279,8 @@ BEGIN
 	THEN
 		RAISE EXCEPTION 'Existing sharding is broken in node group %, requiring further investigation', group;
 	END IF;
-	
-	 
+
+
 END
 $$ LANGUAGE plpgsql;
 
