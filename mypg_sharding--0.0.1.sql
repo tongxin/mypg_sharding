@@ -28,31 +28,39 @@ $$;
 
 -- The global sharding state is maintained in the following defined tables.
 
--- Node groups
-CREATE TABLE nodegroup (
-	groupid		smallint	PRIMARY KEY,
-	balanced	boolean
-	info		text						-- short description
+-------------------------------------------------------------------------------
+-- Node group
+--
+-- The database nodes are organized in non-overlapping node groups which 
+-- define the scopes of data distribution for all sharding related operations.
+-- For instance, the cluster is comprised of node1, node2, ... node10, where
+-- node1 ... node7 are in group1, and node8 ... node10 are in group2. Note,
+-- here a node refers a database instance, and hence multiple nodes can be
+-- arranged to reside in one physical host. Grouping nodes makes it simple to
+-- implement table collocation as related tables can be sharded in the same way
+-- in the same node group.
+-------------------------------------------------------------------------------
+CREATE TABLE	nodegroup (
+	gid			smallint	NOT NULL,
+	node_name	text		NOT NULL,
+	node_idx	smallint	NOT NULL,	
+	UNIQUE		(gid, node_name)
 );
 
--- The list of cluster nodes for sharding to take place on
-CREATE TABLE nodeinfo (
-	node_name	text	PRIMARY KEY,
-	system_id	bigint	NOT NULL	UNIQUE,
-	coninfo		text	NOT NULL,		   	-- may require superuser role
-	group		smallint	REFERENCES nodegroup,
-											-- assign a group to this node
-	balanced_idx	int						-- NULL means data balance work is not done yet on this node
-											-- otherwise a unique balanced index in the node group
+-- Node information
+CREATE TABLE 	node (
+	node_name	text		PRIMARY KEY,
+	host_addr	text		NOT NULL,
+	system_id	bigint		NOT NULL	UNIQUE,
+	coninfo		text		NOT NULL,		-- may require superuser role
 );
 
--- List of all distributed tables.
+-- Table information
 CREATE TABLE tableinfo (
 	table_name	text	PRIMARY KEY,  		-- sharding table's global name
-	sharding_key		text,				-- partition key expression
-	group				smallint,			-- assigned node group
-	create_sql			text       			-- sql to create the table
---	create_rules_sql text          			-- sql to create rules for shared table
+	sharding_key	text,					-- partition key expression
+	gid			smallint,					-- assigned node group
+	create_sql	text       					-- sql to create the table
 );
 
 -- Make the above config tables dump-able
@@ -61,20 +69,41 @@ CREATE TABLE tableinfo (
 -- SELECT pg_catalog.pg_extension_config_dump('mypg.partitions', '');
 
 -- Sharding interface functions
-CREATE FUNCTION new_nodegroup (
-	IN	descr			text,
-	OUT	gid				smallint
+CREATE FUNCTION create_nodegroup (
+	nodes	text[]
 )
 RETURNS smallint AS $$
+DECLARE
+	max_gid		smallint;
+	valid_nodes	text[];
 BEGIN
-	INSERT INTO mypg.nodegroup	(balanced,	info)
-	VALUES 						(TRUE,		descr);
-	RETURNING 	groupid	INTO	gid;
+	SET TRANSACTION ISOLATION LEVEL repeatable_read;
+	max_gid :=	SELECT	max(gid)
+				FROM	mypg.nodegroup;
+	
+	nodes	:=	SELECT 	array_agg(ns.node_name)
+				FROM	(SELECT DISTINCT unnest(nodes) node_name) ns;
+
+	valid_nodes :=
+				SELECT	array_agg(node_name)
+				FROM	node
+				EXCEPT
+				SELECT 	node_name
+				FROM	nodegroup;
+
+	IF NOT nodes <@ valid_nodes
+		RAISE EXCEPTION 'Some nodes are either unknown or already assigned group.'
+	END IF;
+
+	INSERT INTO mypg.nodegroup 	(gid, node_name, node_idx)
+		SELECT	max_gid, unnest(nodes), generate_series(1, count(nodes)); 
+
+	RETURNING 	gid;
 END 
 $$ LANGUAGE plpgsql;
 
 -- Add new node to the sharding cluster. Some constraints include: ...
-CREATE FUNCTION add_node (
+CREATE FUNCTION register_node (
 	newnode_name 	text,
 	newnode_coninfo text,
 	newnode_group		smallint
